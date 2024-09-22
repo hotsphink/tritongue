@@ -199,12 +199,12 @@ impl TrinityCommand for Component {
                     For example, to create a new rule which links to a Github issue, run something
                     like:
 
-                        !admin linkify new issue "(issue ?#?|# ?)([0-9]+)(\\s|$)" https://github.com/bnjbvr/trinity/issues/$2
+                        !admin linkify new issue "(issue ?#?|# ?)([0-9]+)(\\s|$)" https://github.com/hotsphink/tritongue/issues/$2
 
                     The `$2` will be substituted with the second regex capture group (which is the
                     issue number in this example). It's also possible to use named capture groups, e.g:
 
-                        !admin linkify new issue "(issue ?#?|# ?)(?P<issue>[0-9]+)(\\s|$)" https://github.com/bnjbvr/trinity/issues/${issue}
+                        !admin linkify new issue "(issue ?#?|# ?)(?P<issue>[0-9]+)(\\s|$)" https://github.com/hotsphink/tritongue/issues/${issue}
 
                     Then for each room you'd like this rule enabled, run:
 

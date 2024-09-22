@@ -1,7 +1,7 @@
 # Build image.
 
 FROM rust:1.68 AS builder
-LABEL maintainer="Benjamin Bouvier <public@benj.me>"
+LABEL maintainer="Steve Fink <sphink@gmail.com>"
 
 RUN mkdir -p /build/modules
 
@@ -39,18 +39,18 @@ RUN apt-get update && \
     apt-get install -y ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \
     update-ca-certificates && \
-    mkdir -p /opt/trinity/data && \
-    mkdir -p /opt/trinity/modules/target/wasm32-unknown-unknown/release
+    mkdir -p /opt/tritongue/data && \
+    mkdir -p /opt/tritongue/modules/target/wasm32-unknown-unknown/release
 
-COPY --from=builder /build/target/release/trinity /opt/trinity/trinity
+COPY --from=builder /build/target/release/tritongue /opt/tritongue/tritongue
 COPY --from=builder \
     /build/modules/target/wasm32-unknown-unknown/release/*.wasm \
-    /opt/trinity/modules/target/wasm32-unknown-unknown/release
+    /opt/tritongue/modules/target/wasm32-unknown-unknown/release
 
-ENV MATRIX_STORE_PATH /opt/trinity/data/cache
-ENV REDB_PATH /opt/trinity/data/db
+ENV MATRIX_STORE_PATH /opt/tritongue/data/cache
+ENV REDB_PATH /opt/tritongue/data/db
 
-VOLUME /opt/trinity/data
+VOLUME /opt/tritongue/data
 
-WORKDIR /opt/trinity
-CMD /opt/trinity/trinity
+WORKDIR /opt/tritongue
+CMD /opt/tritongue/tritongue
