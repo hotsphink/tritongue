@@ -2,12 +2,13 @@ mod admin_table;
 mod room_resolver;
 mod wasm;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use matrix_sdk::{
     config::SyncSettings,
     event_handler::Ctx,
     room::Room,
     ruma::{
+        api::client::session::get_login_types::v3::{IdentityProvider, LoginType},
         events::{
             reaction::{ReactionEventContent, Relation},
             room::{
@@ -18,13 +19,15 @@ use matrix_sdk::{
         presence::PresenceState,
         OwnedUserId, RoomId, UserId,
     },
-    Client,
+    Client, LoginBuilder,
 };
 use notify::{RecursiveMode, Watcher};
 use room_resolver::RoomResolver;
 use serde::Deserialize;
-use std::{collections::HashMap, env, fs, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
     sync::Mutex,
     time::{sleep, Duration},
 };
@@ -37,11 +40,13 @@ use crate::admin_table::DEVICE_ID_ENTRY;
 #[derive(Deserialize)]
 pub struct BotConfig {
     /// the matrix homeserver the bot should connect to.
-    pub home_server: String,
+    pub home_server: Option<String>,
     /// the user_id to be used on the homeserver.
     pub user_id: String,
     /// password to be used to log into the homeserver.
-    pub password: String,
+    pub password: Option<String>,
+    /// access_token to borrow a login made through some other means
+    pub access_token: Option<String>,
     /// where to store the matrix-sdk internal data.
     pub matrix_store_path: String,
     /// where to store the additional database data.
@@ -115,9 +120,10 @@ impl BotConfig {
 
         debug!("Using configuration from environment");
         Ok(Self {
-            home_server,
+            home_server: Some(home_server),
             user_id,
-            password,
+            password: Some(password),
+            access_token: None,
             matrix_store_path,
             admin_user_id,
             redb_path,
@@ -125,6 +131,12 @@ impl BotConfig {
             modules_config: None,
         })
     }
+}
+
+struct AuthInfo<'a> {
+    _config: &'a BotConfig,
+    /// used for SSO authentication
+    login_token: String,
 }
 
 pub(crate) type ShareableDatabase = Arc<redb::Database>;
@@ -504,20 +516,124 @@ async fn on_stripped_state_member(
     }
 }
 
+async fn login_with_password<'a, 'b>(config: &'a BotConfig, client: &'b Client)
+                                 -> Result<LoginBuilder<'a>, anyhow::Error>
+where 'b: 'a {
+    println!("Logging in with username and password...");
+    let Some(password) = &config.password else { bail!("password required") };
+    Ok(
+        client.login_username(
+            &config.user_id,
+            password,
+        ).initial_device_display_name("my initial device display name (TODO)")
+    )
+}
+
+async fn login_with_sso<'a, 'b>(
+    info: &'a mut AuthInfo<'a>,
+    client: &'b Client,
+    idp: Option<&IdentityProvider>
+) -> Result<LoginBuilder<'a>, anyhow::Error>
+where 'b: 'a {
+    let sso_url = client.get_sso_login_url(
+        "http://localhost:43210/callback",
+        idp.map(|p| p.id.as_str())
+    ).await;
+
+    if let Some(prov) = idp {
+        println!("using id provider {}", prov.name);
+    }
+
+    println!("\nOpen this URL in your browser: {:?}", sso_url.unwrap());
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 43210));
+    let listener = TcpListener::bind(&addr).await?;
+    println!("Listening on: http://{}", addr);
+    let mut token: Result<String, anyhow::Error>;
+    loop {
+        println!("accepting...");
+        let (mut stream, _) = listener.accept().await?;
+
+        token = tokio::task::spawn(async move {
+            let mut buffer = [0; 1024];
+            let nread = stream.read(&mut buffer).await?;
+            println!("read {} bytes", nread);
+            let Some(first_newline) = buffer[..nread].iter().position(|&c| c == 10)
+            else { bail!("Invalid request (short)") };
+            let data = std::str::from_utf8(&buffer[..first_newline])?;
+            let Some(mut start) = data.find("?loginToken=")
+            else { bail!("Invalid request (no token)"); };
+            start += 12;
+            let Some(mut end) = data[start..].find(" ")
+            else { bail!("Invalid request (no space)") };
+            end += start;
+            let token = String::from(&data[start..end]);
+
+            let contents = "<h1>Logging in</h1><p>You may close this page.";
+            let content_length = contents.len();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\n\r\n{contents}");
+            let _ = stream.write_all(response.as_bytes()).await;
+            Ok(token)
+        }).await?;
+
+        if token.is_ok() { break }
+        println!("error = {}", token.unwrap_err());
+    }
+
+    info.login_token = String::from(token.unwrap());
+    Ok(client.login_token(&info.login_token))
+}
+
 /// Run the client for the given `BotConfig`.
 pub async fn run(config: BotConfig) -> anyhow::Result<()> {
+    let user_id = UserId::parse(config.user_id.clone())?;
     let client = Client::builder()
-        .server_name(config.home_server.as_str().try_into()?)
+        .server_name(user_id.server_name())
         .sled_store(&config.matrix_store_path, None)?
         .build()
         .await?;
 
     // Create the database, and try to find a device id.
-    let db = Arc::new(unsafe { redb::Database::create(config.redb_path, 1024 * 1024)? });
+    let db = Arc::new(unsafe { redb::Database::create(config.redb_path.clone(), 1024 * 1024)? });
 
     // First we need to log in.
     debug!("logging in...");
-    let mut login_builder = client.login_username(&config.user_id, &config.password);
+    let login_types = client.get_login_types().await?.flows;
+    debug!("login types supported by server: {login_types:?}");
+
+    let mut info = AuthInfo { _config: &config, login_token: String::from("") };
+    let mut login_builder = None;
+    for login_type in login_types {
+        match login_type {
+            LoginType::Password(_) => {
+                if config.password.is_some() {
+                    login_builder = login_with_password(&config, &client).await.ok(); // FIXME
+                    break
+                }
+            },
+            LoginType::Sso(ref sso) => {
+                login_builder =
+                    match sso.identity_providers.len() {
+                        0 => login_with_sso(&mut info, &client, None).await.ok(), // FIXME
+                        1 => login_with_sso(&mut info, &client, Some(&sso.identity_providers[0])).await.ok(), // FIXME
+                        _ => panic!("TODO: Multiple identity providers"),
+                    };
+                break;
+            },
+            LoginType::Token(_) => {}, // Used for SSO
+            _ => {},
+        }
+    }
+
+    if login_builder.is_none() {
+        // Try access_token.
+    }
+
+    if login_builder.is_none() {
+        bail!("Login failed!");
+    };
+
+    let mut login_builder = login_builder.unwrap();
 
     let mut db_device_id = None;
     if let Some(device_id) = admin_table::read_str(&db, DEVICE_ID_ENTRY)
