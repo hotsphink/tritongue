@@ -226,9 +226,7 @@ fn try_handle_admin<'a>(
     modules: impl Clone + Iterator<Item = &'a Module>,
     room_resolver: &mut RoomResolver,
 ) -> Option<Vec<wasm::Action>> {
-    let Some(rest) = content.strip_prefix("!admin") else {
-        return None;
-    };
+    let rest = content.strip_prefix("!admin")?;
 
     trace!("trying admin for {content}");
 
@@ -282,9 +280,7 @@ fn try_handle_help<'a>(
     store: &mut wasmtime::Store<GuestState>,
     modules: impl Clone + Iterator<Item = &'a Module>,
 ) -> Option<wasm::Action> {
-    let Some(rest) = content.strip_prefix("!help") else {
-        return None;
-    };
+    let rest = content.strip_prefix("!help")?;
 
     // Special handling for help messages.
     let (msg, html) = if rest.trim().is_empty() {
@@ -334,11 +330,11 @@ fn try_handle_help<'a>(
         return None;
     };
 
-    return Some(wasm::Action::Respond(wasm::Message {
+    Some(wasm::Action::Respond(wasm::Message {
         text: msg,
         html: Some(html),
         to: sender.to_string(), // TODO rather room?
-    }));
+    }))
 }
 
 enum AnyEvent {
@@ -580,7 +576,7 @@ where 'b: 'a {
         println!("error = {}", token.unwrap_err());
     }
 
-    info.login_token = String::from(token.unwrap());
+    info.login_token = token.unwrap();
     Ok(client.login_token(&info.login_token))
 }
 
@@ -660,7 +656,7 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
             .context("writing new device_id into the database")?;
     }
 
-    let modules_config = config.modules_config.unwrap_or_else(HashMap::new);
+    let modules_config = config.modules_config.unwrap_or_default();
 
     client
         .user_id()
@@ -723,7 +719,7 @@ async fn handle_signals() -> anyhow::Result<()> {
     use signal_hook::consts::signal::*;
     use signal_hook_tokio::*;
 
-    let mut signals = Signals::new(&[SIGINT, SIGHUP, SIGQUIT, SIGTERM])?;
+    let mut signals = Signals::new([SIGINT, SIGHUP, SIGQUIT, SIGTERM])?;
     let handle = signals.handle();
 
     while let Some(signal) = signals.next().await {

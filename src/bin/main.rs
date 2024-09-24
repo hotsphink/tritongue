@@ -1,5 +1,4 @@
 use anyhow::bail;
-use dirs;
 use trinity::BotConfig;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +19,7 @@ fn config_dir_filename(path: Option<String>, default: &str) -> Result<Option<Pat
         let config_dir = config_root.join("tritongue");
         let rel = config_dir.join(default);
         if rel.is_file() {
-            Ok(rel.to_str().map(|s| PathBuf::from(s)))
+            Ok(rel.to_str().map(PathBuf::from))
         } else {
             Ok(None)
         }
