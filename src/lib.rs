@@ -512,9 +512,9 @@ async fn on_stripped_state_member(
     }
 }
 
-async fn login_with_password<'a, 'b>(config: &'a BotConfig, client: &'b Client)
+async fn login_with_password<'a>(config: &'a BotConfig, client: &Client)
                                  -> Result<LoginBuilder<'a>, anyhow::Error>
-where 'b: 'a {
+{
     println!("Logging in with username and password...");
     let Some(password) = &config.password else { bail!("password required") };
     Ok(
@@ -525,14 +525,18 @@ where 'b: 'a {
     )
 }
 
-async fn login_with_sso<'a, 'b>(
+async fn login_with_sso<'a>(
     info: &'a mut AuthInfo<'a>,
-    client: &'b Client,
+    client: &Client,
     idp: Option<&IdentityProvider>
 ) -> Result<LoginBuilder<'a>, anyhow::Error>
-where 'b: 'a {
+{
+    let addr = SocketAddr::from(([0, 0, 0, 0], 43210));
+    let listener = TcpListener::bind(&addr).await?;
+    println!("Listening on: http://{}", addr);
+
     let sso_url = client.get_sso_login_url(
-        "http://localhost:43210/callback",
+        &format!("http://localhost:{}/callback", addr.port()),
         idp.map(|p| p.id.as_str())
     ).await;
 
@@ -542,9 +546,6 @@ where 'b: 'a {
 
     println!("\nOpen this URL in your browser: {:?}", sso_url.unwrap());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 43210));
-    let listener = TcpListener::bind(&addr).await?;
-    println!("Listening on: http://{}", addr);
     let mut token: Result<String, anyhow::Error>;
     loop {
         println!("accepting...");
