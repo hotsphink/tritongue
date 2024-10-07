@@ -6,31 +6,41 @@ use anyhow::{Context, bail};
 use matrix_sdk::{
     config::SyncSettings,
     event_handler::Ctx,
+    matrix_auth::{MatrixAuth, MatrixSession, MatrixSessionTokens, LoginBuilder},
     room::Room,
+    RoomState,
     ruma::{
         api::client::session::get_login_types::v3::{IdentityProvider, LoginType},
         events::{
-            reaction::{ReactionEventContent, Relation},
+            key::verification::{request::ToDeviceKeyVerificationRequestEvent, VerificationMethod},
+            reaction::ReactionEventContent,
+            relation::Annotation,
             room::{
                 member::StrippedRoomMemberEvent,
-                message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
+                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent, SyncRoomMessageEvent},
             },
         },
         presence::PresenceState,
         OwnedUserId, RoomId, UserId,
     },
-    Client, LoginBuilder,
+    encryption::verification::{Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState},
+    Client,
 };
+use matrix_sdk_base::SessionMeta;
+use matrix_sdk_sqlite;
 use notify::{RecursiveMode, Watcher};
 use room_resolver::RoomResolver;
 use serde::Deserialize;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use tokio;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::Mutex,
     time::{sleep, Duration},
 };
+use tokio_stream::StreamExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info, trace, warn};
 use wasm::{GuestState, Module, WasmModules};
 
@@ -47,6 +57,9 @@ pub struct BotConfig {
     pub password: Option<String>,
     /// access_token to borrow a login made through some other means
     pub access_token: Option<String>,
+    /// device_id is required if using the access_token, though it
+    /// can also come from the db.
+    pub device_id: Option<String>,
     /// where to store the matrix-sdk internal data.
     pub matrix_store_path: String,
     /// where to store the additional database data.
@@ -124,6 +137,7 @@ impl BotConfig {
             user_id,
             password: Some(password),
             access_token: None,
+            device_id: None,
             matrix_store_path,
             admin_user_id,
             redb_path,
@@ -343,126 +357,224 @@ enum AnyEvent {
 }
 
 impl AnyEvent {
-    async fn send(self, room: &mut matrix_sdk::room::Joined) -> anyhow::Result<()> {
+    async fn send(self, room: &mut Room) -> anyhow::Result<()> {
         let _ = match self {
-            AnyEvent::RoomMessage(e) => room.send(e, None).await?,
-            AnyEvent::Reaction(e) => room.send(e, None).await?,
+            AnyEvent::RoomMessage(e) => room.send(e).await?,
+            AnyEvent::Reaction(e) => room.send(e).await?,
         };
+        Ok(())
+    }
+}
+
+async fn on_verification_request(ev: ToDeviceKeyVerificationRequestEvent, client: Client) -> anyhow::Result<()> {
+    let request = client
+        .encryption()
+        .get_verification_request(&ev.sender, &ev.content.transaction_id)
+        .await
+        .expect("Request object wasn't created");
+    if !request.is_self_verification() {
+        debug!("Only self-verification supported for now");
+        return Ok(());
+    }
+
+    tokio::spawn(request_verification_handler(client, request));
+    Ok(())
+}
+
+async fn request_verification_handler(client: Client, request: VerificationRequest) -> anyhow::Result<()> {
+    println!("Accepting verification request from {} (me)", request.other_user_id(),);
+    request.accept().await?; // Now the craziness starts...
+
+    println!("Supported methods: {:?}", request.their_supported_methods());
+    if let Some(methods) = request.their_supported_methods() {
+        if ! methods.contains(&VerificationMethod::SasV1) {
+            bail!("Only SasV1 supported for now");
+        }
+    } else {
+        bail!("No verification methods supported??!");
+    }
+
+    let mut stream = request.changes();
+    while let Some(state) = stream.next().await {
+        match state {
+            VerificationRequestState::Created { .. }
+            | VerificationRequestState::Requested { .. }
+            | VerificationRequestState::Ready { .. } => (),
+            VerificationRequestState::Transitioned { verification } => {
+                if let Verification::SasV1(s) = verification {
+                    tokio::spawn(sas_verification_handler(client, s));
+                    break;
+                }
+            },
+            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => break,
+        }
+    }
+
+    Ok(())
+}
+
+async fn sas_verification_handler(_client: Client, sas: SasVerification) -> anyhow::Result<()> {
+    println!("Starting verification");
+    sas.accept().await?;
+    let mut stream = sas.changes();
+
+    while let Some(state) = stream.next().await {
+        if let SasState::KeysExchanged{emojis, decimals: _} = state {
+            tokio::spawn(wait_for_confirmation(sas.clone(), emojis.unwrap().emojis));
+        } else if let SasState::Done{ .. } = state {
+            println!("Successfully verified: {:?}", sas.other_device().local_trust_state());
+            return Ok(());
+        } else {
+            println!("Other state: {:?}", state);
+        }
+    }
+
+    bail!("Sas verification seems to have failed?");
+}
+
+async fn wait_for_confirmation(sas: SasVerification, emoji: [Emoji; 7]) -> anyhow::Result<()> {
+    println!("Verification emoji: {}", emoji.map(|e| format!("{}{}", e.symbol, e.description)).join(" "));
+
+    print!("Does it match (y/n)? ");
+    let stdin = tokio::io::stdin();
+    let mut reader = FramedRead::new(stdin, LinesCodec::new());
+    if let Some(line) = reader.next().await {
+        let line = line.expect("unable to decode");
+        if line == "y" {
+            if let Err(err) = sas.confirm().await {
+                println!("ERROR: {}", err);
+                Err(err.into())
+            } else {
+                bail!("confirmation failed");
+            }
+        } else {
+            if let Err(err) = sas.cancel().await {
+                println!("ERROR cancelling: {}", err);
+                Err(err.into())
+            } else {
+                bail!("cancellation failed");
+            }
+        }
+    } else {
         Ok(())
     }
 }
 
 async fn on_message(
     ev: SyncRoomMessageEvent,
-    room: Room,
+    mut room: Room,
     client: Client,
     Ctx(ctx): Ctx<App>,
 ) -> anyhow::Result<()> {
-    let mut room = if let Room::Joined(room) = room {
-        room
-    } else {
+    if room.state() != RoomState::Joined {
         // Ignore non-joined rooms events.
         return Ok(());
-    };
+    }
 
     if ev.sender() == client.user_id().unwrap() {
         // Skip messages sent by the bot.
         return Ok(());
     }
 
-    if let Some(unredacted) = ev.as_original() {
-        let content = if let MessageType::Text(text) = &unredacted.content.msgtype {
-            text.body.to_string()
-        } else {
-            // Ignore other kinds of messages at the moment.
-            return Ok(());
-        };
+    if ev.as_original().is_none() {
+        trace!("redacted message");
+        return Ok(());
+    }
 
-        trace!(
-            "Received a message from {} in {}: {}",
-            ev.sender(),
-            room.room_id(),
-            content,
-        );
+    let unredacted = ev.as_original().unwrap();
 
-        // TODO ohnoes, locking across other awaits is bad
-        // TODO Use a lock-free data-structure for the list of modules + put locks in the module
-        // internal implementation?
-        // TODO or create a new wasm instance per message \o/
-        let ctx = ctx.inner.clone();
-        let room_id = room.room_id().to_owned();
+    let content = if let MessageType::Text(text) = &unredacted.content.msgtype {
+        text.body.to_string()
+    } else {
+        // Ignore other kinds of messages at the moment.
+        return Ok(());
+    };
 
-        let event_id = ev.event_id().to_owned();
+    // TEMPORARY: Switch back to trace!
+    info!(
+        "Received a message from {} in {}: {}",
+        ev.sender(),
+        room.room_id(),
+        content,
+    );
 
-        let new_actions = tokio::task::spawn_blocking(move || {
-            let ctx = &mut *futures::executor::block_on(ctx.lock());
+    // TODO ohnoes, locking across other awaits is bad
+    // TODO Use a lock-free data-structure for the list of modules + put locks in the module
+    // internal implementation?
+    // TODO or create a new wasm instance per message \o/
+    let ctx = ctx.inner.clone();
+    let room_id = room.room_id().to_owned();
 
-            let (store, modules) = ctx.modules.iter();
+    let event_id = ev.event_id().to_owned();
 
-            if ev.sender() == ctx.admin_user_id {
-                match try_handle_admin(
-                    &content,
-                    &ctx.admin_user_id,
-                    &room_id,
-                    store,
-                    modules.clone(),
-                    &mut ctx.room_resolver,
-                ) {
-                    None => {}
-                    Some(actions) => {
-                        trace!("handled by admin, skipping modules");
+    let new_actions = tokio::task::spawn_blocking(move || {
+        let ctx = &mut *futures::executor::block_on(ctx.lock());
+
+        let (store, modules) = ctx.modules.iter();
+
+        if ev.sender() == ctx.admin_user_id {
+            match try_handle_admin(
+                &content,
+                &ctx.admin_user_id,
+                &room_id,
+                store,
+                modules.clone(),
+                &mut ctx.room_resolver,
+            ) {
+                None => {}
+                Some(actions) => {
+                    trace!("handled by admin, skipping modules");
+                    return actions;
+                }
+            }
+        }
+
+        if let Some(actions) = try_handle_help(&content, ev.sender(), store, modules.clone()) {
+            trace!("handled by help, skipping modules");
+            return vec![actions];
+        }
+
+        for module in modules {
+            trace!("trying to handle message with {}...", module.name());
+            match module.handle(&mut *store, &content, ev.sender(), &room_id) {
+                Ok(actions) => {
+                    if !actions.is_empty() {
+                        // TODO support handling the same message with several handlers.
+                        trace!("{} returned a response!", module.name());
                         return actions;
                     }
                 }
-            }
-
-            if let Some(actions) = try_handle_help(&content, ev.sender(), store, modules.clone()) {
-                trace!("handled by help, skipping modules");
-                return vec![actions];
-            }
-
-            for module in modules {
-                trace!("trying to handle message with {}...", module.name());
-                match module.handle(&mut *store, &content, ev.sender(), &room_id) {
-                    Ok(actions) => {
-                        if !actions.is_empty() {
-                            // TODO support handling the same message with several handlers.
-                            trace!("{} returned a response!", module.name());
-                            return actions;
-                        }
-                    }
-                    Err(err) => {
-                        warn!("wasm module {} ran into an error: {err}", module.name());
-                    }
+                Err(err) => {
+                    warn!("wasm module {} ran into an error: {err}", module.name());
                 }
             }
-
-            Vec::new()
-        })
-        .await?;
-
-        let new_events = new_actions
-            .into_iter()
-            .map(|a| match a {
-                wasm::Action::Respond(msg) => {
-                    let content = if let Some(html) = msg.html {
-                        RoomMessageEventContent::text_html(msg.text, html)
-                    } else {
-                        RoomMessageEventContent::text_plain(msg.text)
-                    };
-                    AnyEvent::RoomMessage(content)
-                }
-                wasm::Action::React(reaction) => {
-                    let reaction =
-                        ReactionEventContent::new(Relation::new(event_id.clone(), reaction));
-                    AnyEvent::Reaction(reaction)
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for event in new_events {
-            event.send(&mut room).await?;
         }
+
+        Vec::new()
+    })
+    .await?;
+
+    let new_events = new_actions
+        .into_iter()
+        .map(|a| match a {
+            wasm::Action::Respond(msg) => {
+                let content = if let Some(html) = msg.html {
+                    RoomMessageEventContent::text_html(msg.text, html)
+                } else {
+                    RoomMessageEventContent::text_plain(msg.text)
+                };
+                AnyEvent::RoomMessage(content)
+            }
+            wasm::Action::React(reaction) => {
+                let reaction =
+                    ReactionEventContent::new(Annotation::new(event_id.clone(), reaction));
+                AnyEvent::Reaction(reaction)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for event in new_events {
+        event.send(&mut room).await?;
     }
 
     Ok(())
@@ -480,7 +592,7 @@ async fn on_stripped_state_member(
     }
 
     // looks like the room is an invited room, let's attempt to join then
-    if let Room::Invited(room) = room {
+    if room.state() == RoomState::Invited {
         // The event handlers are called before the next sync begins, but
         // methods that change the state of a room (joining, leaving a room)
         // wait for the sync to return the new room state so we need to spawn
@@ -489,7 +601,7 @@ async fn on_stripped_state_member(
             debug!("Autojoining room {}", room.room_id());
             let mut delay = 1;
 
-            while let Err(err) = room.accept_invitation().await {
+            while let Err(err) = room.join().await {
                 // retry autojoin due to synapse sending invites, before the
                 // invited user can join for more information see
                 // https://github.com/matrix-org/synapse/issues/4345
@@ -513,12 +625,12 @@ async fn on_stripped_state_member(
 }
 
 async fn login_with_password<'a>(config: &'a BotConfig, client: &Client)
-                                 -> Result<LoginBuilder<'a>, anyhow::Error>
+                                 -> Result<LoginBuilder, anyhow::Error>
 {
     println!("Logging in with username and password...");
     let Some(password) = &config.password else { bail!("password required") };
     Ok(
-        client.login_username(
+        client.matrix_auth().login_username(
             &config.user_id,
             password,
         ).initial_device_display_name("my initial device display name (TODO)")
@@ -527,15 +639,15 @@ async fn login_with_password<'a>(config: &'a BotConfig, client: &Client)
 
 async fn login_with_sso<'a>(
     info: &'a mut AuthInfo<'a>,
-    client: &Client,
+    auth: &MatrixAuth,
     idp: Option<&IdentityProvider>
-) -> Result<LoginBuilder<'a>, anyhow::Error>
+) -> Result<LoginBuilder, anyhow::Error>
 {
     let addr = SocketAddr::from(([0, 0, 0, 0], 43210));
     let listener = TcpListener::bind(&addr).await?;
     println!("Listening on: http://{}", addr);
 
-    let sso_url = client.get_sso_login_url(
+    let sso_url = auth.get_sso_login_url(
         &format!("http://localhost:{}/callback", addr.port()),
         idp.map(|p| p.id.as_str())
     ).await;
@@ -544,7 +656,7 @@ async fn login_with_sso<'a>(
         println!("using id provider {}", prov.name);
     }
 
-    println!("\nOpen this URL in your browser: {:?}", sso_url.unwrap());
+    println!("\nOpen this URL in your browser: {}", sso_url.unwrap());
 
     let mut token: Result<String, anyhow::Error>;
     loop {
@@ -578,59 +690,66 @@ async fn login_with_sso<'a>(
     }
 
     info.login_token = token.unwrap();
-    Ok(client.login_token(&info.login_token))
+    Ok(auth.login_token(&info.login_token))
 }
 
 /// Run the client for the given `BotConfig`.
 pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     let user_id = UserId::parse(config.user_id.clone())?;
+    let base_dir = if let Some(dir) = dirs::data_dir() {
+        dir
+    } else if let Ok(dir) = std::env::current_dir() {
+        dir
+    } else {
+        PathBuf::from(".")
+    };
+    let store_path = base_dir.join(&config.matrix_store_path);
+    let redb_path = base_dir.join(&config.redb_path);
+
+    let store = matrix_sdk_sqlite::make_store_config(&store_path, None).await?;
     let client = Client::builder()
         .server_name(user_id.server_name())
-        .sled_store(&config.matrix_store_path, None)?
+        .store_config(store)
         .build()
         .await?;
 
     // Create the database, and try to find a device id.
-    let db = Arc::new(unsafe { redb::Database::create(config.redb_path.clone(), 1024 * 1024)? });
+    let db = Arc::new(unsafe { redb::Database::create(redb_path, 1024 * 1024)? });
 
     // First we need to log in.
     debug!("logging in...");
-    let login_types = client.get_login_types().await?.flows;
+    let login_types = client.matrix_auth().get_login_types().await?.flows;
     debug!("login types supported by server: {login_types:?}");
 
     let mut info = AuthInfo { _config: &config, login_token: String::from("") };
     let mut login_builder = None;
-    for login_type in login_types {
-        match login_type {
-            LoginType::Password(_) => {
-                if config.password.is_some() {
-                    login_builder = login_with_password(&config, &client).await.ok(); // FIXME
-                    break
-                }
-            },
-            LoginType::Sso(ref sso) => {
-                login_builder =
-                    match sso.identity_providers.len() {
-                        0 => login_with_sso(&mut info, &client, None).await.ok(), // FIXME
-                        1 => login_with_sso(&mut info, &client, Some(&sso.identity_providers[0])).await.ok(), // FIXME
-                        _ => panic!("TODO: Multiple identity providers"),
-                    };
-                break;
-            },
-            LoginType::Token(_) => {}, // Used for SSO
-            _ => {},
+    if config.access_token.is_none() {
+        for login_type in login_types {
+            match login_type {
+                LoginType::Password(_) => {
+                    if config.password.is_some() {
+                        login_builder = login_with_password(&config, &client).await.ok(); // FIXME
+                        break
+                    }
+                },
+                LoginType::Sso(ref sso) => {
+                    login_builder =
+                        match sso.identity_providers.len() {
+                            0 => login_with_sso(&mut info, &client.matrix_auth(), None).await.ok(), // FIXME
+                            1 => login_with_sso(&mut info, &client.matrix_auth(), Some(&sso.identity_providers[0])).await.ok(), // FIXME
+                            _ => panic!("TODO: Multiple identity providers"),
+                        };
+                    break;
+                },
+                LoginType::Token(_) => {}, // Used for SSO
+                _ => {},
+            }
         }
+
+        if login_builder.is_none() {
+            bail!("Login failed!");
+        };
     }
-
-    if login_builder.is_none() {
-        // Try access_token.
-    }
-
-    if login_builder.is_none() {
-        bail!("Login failed!");
-    };
-
-    let mut login_builder = login_builder.unwrap();
 
     let mut db_device_id = None;
     if let Some(device_id) = admin_table::read_str(&db, DEVICE_ID_ENTRY)
@@ -640,21 +759,43 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         // the login builder keeps a reference to the previous device id string, so can't clone
         // db_device_id here, it has to outlive the login_builder.
         db_device_id = Some(device_id);
-        login_builder = login_builder.device_id(db_device_id.as_ref().unwrap());
+        if let Some(lb) = login_builder {
+            login_builder = Some(lb.device_id(db_device_id.as_ref().unwrap()));
+        }
     }
 
-    let resp = login_builder.send().await?;
+    let device_id = if let Some(login_builder) = login_builder {
+        let resp = login_builder.send().await?;
+        resp.device_id.to_string()
+    } else if let Some(id) = config.device_id {
+        id
+    } else {
+        bail!("device_id required for access_token login")
+    };
 
-    let resp_device_id = resp.device_id.to_string();
-    if db_device_id.as_ref() != Some(&resp_device_id) {
+    if db_device_id.as_ref() != Some(&device_id) {
         match db_device_id {
             Some(prev) => {
-                warn!("overriding device_id (previous was {prev}, new is {resp_device_id})")
+                warn!("overriding device_id (previous was {prev}, new is {device_id})")
             }
             None => debug!("storing new device_id for the first time..."),
         }
-        admin_table::write_str(&db, DEVICE_ID_ENTRY, &resp_device_id)
+        admin_table::write_str(&db, DEVICE_ID_ENTRY, &device_id)
             .context("writing new device_id into the database")?;
+    }
+
+    if config.access_token.is_some() {
+        let session = MatrixSession {
+            meta: SessionMeta {
+                user_id,
+                device_id: device_id.into(),
+            },
+            tokens: MatrixSessionTokens {
+                access_token: config.access_token.unwrap(),
+                refresh_token: None,
+            }
+        };
+        client.restore_session(session).await?;
     }
 
     let modules_config = config.modules_config.unwrap_or_default();
@@ -667,7 +808,24 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     // messages. If the `StateStore` finds saved state in the location given the
     // initial sync will be skipped in favor of loading state from the store
     debug!("starting initial sync...");
-    client.sync_once(SyncSettings::default()).await.unwrap();
+    let mut sync_settings = SyncSettings::default();
+    if let Some(sync_token) = client.store().get_custom_value(b"hacky-session-persistence").await? {
+        sync_settings = sync_settings.token(String::from_utf8_lossy(&sync_token));
+    }
+    loop {
+        match client.sync_once(sync_settings.clone()).await {
+            Ok(response) => {
+                let sync_token = response.next_batch;
+                sync_settings = sync_settings.token(sync_token.clone());
+                client.store().set_custom_value(b"hacky-session-persistence", sync_token.into()).await?;
+                break;
+            }
+            Err(error) => {
+                println!("error during initial sync: {error}");
+                println!("retrying...");
+            }
+        }
+    }
 
     debug!("setting up app...");
     let client_copy = client.clone();
@@ -685,13 +843,16 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
 
     let _watcher_guard = watcher(app.inner.clone()).await?;
 
+    println!("ACCESS TOKEN FOR SKIPPING LOGIN WHEN RESTARTING (put this in config.toml): {:?}", client.access_token().unwrap());
+
     debug!("setup ready! now listening to incoming messages.");
     client.add_event_handler_context(app);
     client.add_event_handler(on_message);
     client.add_event_handler(on_stripped_state_member);
+    client.add_event_handler(on_verification_request);
 
     // Note: this method will never return.
-    let sync_settings = SyncSettings::default().token(client.sync_token().await.unwrap());
+    client.sync(sync_settings.clone()).await?;
 
     tokio::select! {
         _ = handle_signals() => {
@@ -705,7 +866,7 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
 
     // Set bot presence to offline.
     let request = matrix_sdk::ruma::api::client::presence::set_presence::v3::Request::new(
-        client.user_id().unwrap(),
+        client.user_id().unwrap().to_owned(),
         PresenceState::Offline,
     );
 
@@ -716,7 +877,7 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
 }
 
 async fn handle_signals() -> anyhow::Result<()> {
-    use futures::StreamExt as _;
+    //use futures::StreamExt as _;
     use signal_hook::consts::signal::*;
     use signal_hook_tokio::*;
 

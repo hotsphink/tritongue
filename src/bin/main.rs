@@ -1,8 +1,10 @@
 use anyhow::bail;
+use tracing::Level;
+use tracing_subscriber::{filter, prelude::*};
 use trinity::BotConfig;
 use std::path::{Path, PathBuf};
 
-// If a path is given, return that if it exists else panic. If a path is not
+// If a path is given, return it if it exists else error out. If a path is not
 // given, look in $XDG_CONFIG_DIR/tritongue and return that if it exists else
 // return None.
 //
@@ -27,7 +29,16 @@ fn config_dir_filename(path: Option<String>, default: &str) -> Result<Option<Pat
 }
 
 async fn real_main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let filter = filter::Targets::new()
+    .with_target("trinity", Level::DEBUG)
+    .with_target("sled", Level::INFO)
+    .with_target("hyper::proto", Level::INFO)
+    .with_default(Level::INFO);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
 
     // This really shouldn't be checked if path is given.
     let config_param = std::env::args().nth(1);

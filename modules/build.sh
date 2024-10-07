@@ -2,4 +2,4 @@
 
 set -e
 
-cargo component build --target wasm32-unknown-unknown
+cargo component build --target wasm32-unknown-unknown --release
