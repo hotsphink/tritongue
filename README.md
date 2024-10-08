@@ -150,9 +150,10 @@ Tritongue:
 I wanted a new name. I didn't want to spend a lot of time coming up with one. I
 plan to add in some Python integration, which led me to think of a forked
 tongue, and forked tongue + trinity = tritongue. "Tongue" has a little bit of a
-double-meaning of tongue in terms of language, and it's fundamentally a chat
-bot. But don't overthink it. I certainlyt didn't! (Also, Trinity is still a way
-cooler name.)
+double-meaning of tongue in terms of language, and it's using Rust+WebAssembly+Python.
+Also, it's fundamentally a chat bot. But don't overthink it. I certainlyt didn't!
+
+(Trinity is still a better name.)
 
 ## License
 
