@@ -1,0 +1,9 @@
+- [ ] Move saved files into a tritongue/ subdir
+- [ ] Move wasm stuff to a feature
+- [ ] Implement Python module feature
+- [ ] Make a facility for registering patterns with a command router instead of looping over all modules
+  - allow modules to remove themselves from the loop list
+- [ ] Improve help message, including module-specific help
+- [ ] Verify that room.display_name() lookups are cached
+- [ ] Implement cross-user verification
+- [ ] Fix signal handling

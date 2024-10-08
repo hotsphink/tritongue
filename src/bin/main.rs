@@ -33,7 +33,8 @@ async fn real_main() -> anyhow::Result<()> {
     .with_target("trinity", Level::DEBUG)
     .with_target("sled", Level::INFO)
     .with_target("hyper::proto", Level::INFO)
-    .with_default(Level::INFO);
+    .with_target("matrix_sdk_crypto::backups", Level::ERROR)
+    .with_default(Level::WARN);
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())

@@ -17,7 +17,7 @@ use matrix_sdk::{
             relation::Annotation,
             room::{
                 member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent, SyncRoomMessageEvent},
+                message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
             },
         },
         presence::PresenceState,
@@ -27,12 +27,10 @@ use matrix_sdk::{
     Client,
 };
 use matrix_sdk_base::SessionMeta;
-use matrix_sdk_sqlite;
 use notify::{RecursiveMode, Watcher};
 use room_resolver::RoomResolver;
 use serde::Deserialize;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -432,32 +430,28 @@ async fn sas_verification_handler(_client: Client, sas: SasVerification) -> anyh
     bail!("Sas verification seems to have failed?");
 }
 
+// Ugh, this isn't great. It asks whether the verification emoji match, using stdin.
+// Which means it will get buried in the logging output, and it's kind of a weird way
+// to provide confirmation. I'm not sure what a better way is, though.
+//
+// The code here is very clunky too, but I'm not inclined to clean it up when I really want to replace it entirely.
 async fn wait_for_confirmation(sas: SasVerification, emoji: [Emoji; 7]) -> anyhow::Result<()> {
     println!("Verification emoji: {}", emoji.map(|e| format!("{}{}", e.symbol, e.description)).join(" "));
 
     print!("Does it match (y/n)? ");
+    tokio::io::stdout().flush().await?;
+
     let stdin = tokio::io::stdin();
     let mut reader = FramedRead::new(stdin, LinesCodec::new());
     if let Some(line) = reader.next().await {
         let line = line.expect("unable to decode");
         if line == "y" {
-            if let Err(err) = sas.confirm().await {
-                println!("ERROR: {}", err);
-                Err(err.into())
-            } else {
-                bail!("confirmation failed");
-            }
+            sas.confirm().await.expect("confirmation failed");
         } else {
-            if let Err(err) = sas.cancel().await {
-                println!("ERROR cancelling: {}", err);
-                Err(err.into())
-            } else {
-                bail!("cancellation failed");
-            }
+            sas.cancel().await.expect("cancellation failed");
         }
-    } else {
-        Ok(())
     }
+    Ok(())
 }
 
 async fn on_message(
@@ -494,9 +488,16 @@ async fn on_message(
     info!(
         "Received a message from {} in {}: {}",
         ev.sender(),
-        room.room_id(),
+        room.display_name().await.unwrap(),
         content,
     );
+
+    if content.contains("you are a good boy") {
+        let reaction = ReactionEventContent::new(Annotation::new(ev.event_id().to_owned(), "👀".to_owned()));
+        room.send(reaction).await?;
+        let message = RoomMessageEventContent::text_html("thank you", "thank <a href='htts://aapx.org/'>you</a>");
+        room.send(message).await?;
+    }
 
     // TODO ohnoes, locking across other awaits is bad
     // TODO Use a lock-free data-structure for the list of modules + put locks in the module
