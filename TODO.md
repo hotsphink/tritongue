@@ -1,3 +1,5 @@
+- [x] Fix signal handling
+- [ ] Make signal handling portable to Windows?
 - [ ] Move saved files into a tritongue/ subdir
 - [ ] Move wasm stuff to a feature
 - [ ] Implement Python module feature
@@ -6,4 +8,4 @@
 - [ ] Improve help message, including module-specific help
 - [ ] Verify that room.display_name() lookups are cached
 - [ ] Implement cross-user verification
-- [ ] Fix signal handling
+- [ ] Fix backups

@@ -30,11 +30,11 @@ fn config_dir_filename(path: Option<String>, default: &str) -> Result<Option<Pat
 
 async fn real_main() -> anyhow::Result<()> {
     let filter = filter::Targets::new()
-    .with_target("trinity", Level::DEBUG)
-    .with_target("sled", Level::INFO)
-    .with_target("hyper::proto", Level::INFO)
-    .with_target("matrix_sdk_crypto::backups", Level::ERROR)
-    .with_default(Level::WARN);
+        .with_target("trinity", Level::DEBUG)
+        .with_target("sled", Level::INFO)
+        .with_target("hyper::proto", Level::INFO)
+        .with_target("matrix_sdk_crypto::backups", Level::ERROR)
+        .with_default(Level::WARN);
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -43,8 +43,7 @@ async fn real_main() -> anyhow::Result<()> {
 
     // This really shouldn't be checked if path is given.
     let config_param = std::env::args().nth(1);
-    let Ok(filename) = config_dir_filename(config_param, "config.toml")
-        else { anyhow::bail!("error looking for config file") }; // FIXME: Propagate actual error.
+    let filename = config_dir_filename(config_param, "config.toml")?;
     // Check for a config file, then fallback to env if none found.
     let config = if let Some(config_path) = filename {
         tracing::debug!("parsing config {:?}...", config_path.to_string_lossy());
