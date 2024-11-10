@@ -1,4 +1,5 @@
 mod admin_table;
+pub mod input;
 mod room_resolver;
 mod wasm;
 
