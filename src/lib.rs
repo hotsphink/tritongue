@@ -673,7 +673,7 @@ async fn login_with_sso<'a>(
             let data = std::str::from_utf8(&buffer[..first_newline])?;
             let Some(mut start) = data.find("?loginToken=")
             else { bail!("Invalid request (no token)"); };
-            start += 12;
+            start += 12; // strlen("?loginToken=")
             let Some(mut end) = data[start..].find(" ")
             else { bail!("Invalid request (no space)") };
             end += start;
@@ -703,9 +703,11 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         dir
     } else {
         PathBuf::from(".")
-    };
+    }.join("tritongue");
     let store_path = base_dir.join(&config.matrix_store_path);
+    debug!("Using matrix store_path = {}", store_path.display());
     let redb_path = base_dir.join(&config.redb_path);
+    debug!("Using redb_path = {}", redb_path.display());
 
     let store = matrix_sdk_sqlite::make_store_config(&store_path, None).await?;
     let client = Client::builder()

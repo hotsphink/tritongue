@@ -1,6 +1,6 @@
 - [x] Fix signal handling
 - [ ] Make signal handling portable to Windows?
-- [ ] Move saved files into a tritongue/ subdir
+- [x] Move saved files into a tritongue/ subdir
 - [ ] Move wasm stuff to a feature
 - [ ] Implement Python module feature
 - [ ] Make a facility for registering patterns with a command router instead of looping over all modules
