@@ -1,20 +1,24 @@
 use anyhow;
 use regex::{Captures, Regex, RegexSet};
 
-#[cfg(test)]
-use std::cell::RefCell;
-
 pub struct AMatch<'a> {
     token: u32,
     captures: Captures<'a>,
 }
 
+struct Listener<'a> {
+    regex: Regex,
+    pattern: String,
+    token: u32,
+    callback: Box<dyn FnMut(&str, &Captures) -> () + 'a>,
+}
+
 pub struct InputHandler<'a> {
+    // RegexSet that checks whether any of the regexes match. Invalidated when new patterns are registered.
     anything: Option<RegexSet>,
-    regexes: Vec<Regex>,
-    patterns: Vec<String>,
-    tokens: Vec<u32>,
-    callbacks: Vec<Box<dyn FnMut(&str, &Captures) -> () + 'a>>,
+
+    // Compiled regular expression.
+    listeners: Vec<Listener<'a>>,
 }
 
 fn nop(_input: &str, _dummy: &Captures) -> () {
@@ -24,19 +28,18 @@ impl<'a> InputHandler<'a> {
     pub fn new() -> Self {
         Self {
             anything: None,
-            regexes: vec![],
-            patterns: vec![],
-            tokens: vec![],
-            callbacks: vec![],
+            listeners: vec![],
         }
     }
 
     fn add_full_pattern(&mut self, token: u32, pattern: &str, callback: impl FnMut(&str, &Captures) + 'a) -> anyhow::Result<()> {
         let r = Regex::new(pattern)?;
-        self.patterns.push(pattern.to_string());
-        self.regexes.push(r);
-        self.tokens.push(token);
-        self.callbacks.push(Box::new(callback));
+        self.listeners.push(Listener {
+            pattern: pattern.to_string(),
+            regex: r,
+            token: token,
+            callback: Box::new(callback),
+        });
         self.anything = None; // Invalidate the "does anything match" RegexSet.
         Ok(())
     }
@@ -51,23 +54,23 @@ impl<'a> InputHandler<'a> {
 
     fn ensure(&mut self) -> anyhow::Result<()> {
         if self.anything.is_none() {
-            let anything = RegexSet::new(self.patterns.iter())?;
+            let anything = RegexSet::new(self.listeners.iter().map(|l| &l.pattern))?;
             self.anything = Some(anything);
         }
         Ok(())
     }
 
-    pub fn test<'b>(&mut self, input: &'b str) -> anyhow::Result<Option<AMatch<'b>>> {
+    pub fn parse<'b>(&mut self, input: &'b str) -> anyhow::Result<Option<AMatch<'b>>> {
         self.ensure()?;
         let matches = self.anything.as_ref().unwrap().matches(input);
         for index in matches {
-            let regex = &self.regexes[index];
-            if let Some(caps) = regex.captures(input) {
+            let listener = &mut self.listeners[index];
+            if let Some(caps) = listener.regex.captures(input) {
                 let amatch = AMatch {
-                    token: self.tokens[index],
+                    token: listener.token,
                     captures: caps,
                 };
-                self.callbacks[index](input, &amatch.captures);
+                (listener.callback)(input, &amatch.captures);
                 return Ok(Some(amatch));
             }
         }
@@ -77,26 +80,29 @@ impl<'a> InputHandler<'a> {
 
 #[test]
 pub fn test() {
-    struct TestState { first: String, second: String }
-    let leaked_state = Box::leak(Box::new(RefCell::new(TestState {
-        first: "".to_string(),
-        second: "".to_string()
-    })));
+    use std::cell::RefCell;
 
+    struct TestState { first: String, second: String }
+    let state = RefCell::new(TestState {
+        first: String::default(),
+        second: String::default(),
+    });
+
+    // Note that this is within the scope of `state`, so that the callbacks here can store references to it.
     let mut handler = InputHandler::new();
 
     let pattern = r"3a|5a";
     handler.add_pattern(1, &(r"(?:what is|literal) (?:0x)?((?:ff)*(?P<code>".to_string() + pattern + r"){1,16}(?:ff)*) ?\??$")).expect("invalid regex");
 
     handler.add_callback_pattern(r"test (\w+) (?P<second>\w+)", |_input: &str, caps: &Captures| {
-        leaked_state.borrow_mut().first = caps.get(1).unwrap().as_str().to_string();
-        leaked_state.borrow_mut().second = caps.name("second").unwrap().as_str().to_string();
+        state.borrow_mut().first = caps.get(1).unwrap().as_str().to_string();
+        state.borrow_mut().second = caps.name("second").unwrap().as_str().to_string();
     }).expect("adding pattern");
-    let _ = handler.test("test stabby fish").expect("should match");
-    assert_eq!(leaked_state.borrow().first.as_str(), "stabby");
-    assert_eq!(leaked_state.borrow().second.as_str(), "fish");
+    let _ = handler.parse("test stabby fish").expect("should match");
+    assert_eq!(state.borrow().first.as_str(), "stabby");
+    assert_eq!(state.borrow().second.as_str(), "fish");
 
-    let result = handler.test("what is 0x3a3a3a3a?").expect("should match");
+    let result = handler.parse("what is 0x3a3a3a3a?").expect("should match");
     let result = result.unwrap();
     assert_eq!(result.token, 1);
     assert_eq!(result.captures.name("code").expect("?P<code> should be found").as_str(), "3a");
