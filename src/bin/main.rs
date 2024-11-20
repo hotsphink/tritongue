@@ -1,8 +1,8 @@
 use anyhow::bail;
+use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::{filter, prelude::*};
 use trinity::BotConfig;
-use std::path::{Path, PathBuf};
 
 // If a path is given, return it if it exists else error out. If a path is not
 // given, look in $XDG_CONFIG_DIR/tritongue and return that if it exists else

@@ -13,6 +13,7 @@ path = "src/bin/main.rs"
 
 [dependencies]
 anyhow = "1.0.66"
+directories = "5.0.1"
 dirs = "^5"
 dotenvy = "0.15.6"
 futures = "0.3.25"
@@ -34,4 +35,6 @@ toml = "0.5.10"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
 wasmtime = { version = "14.0.0", features = ["component-model"] }
-directories = "5.0.1"
+pyo3-asyncio-0-21 = { version="^0.21", features = ["attributes", "tokio-runtime"] }
+pyo3 = { version="^0.21", features = [ "auto-initialize" ] }
+pyo3-ffi = "^0.21"

@@ -4,6 +4,7 @@ mod room_resolver;
 mod wasm;
 
 use anyhow::{Context, bail};
+use input::InputHandler;
 use matrix_sdk::{
     config::SyncSettings,
     event_handler::Ctx,
@@ -29,6 +30,8 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::SessionMeta;
 use notify::{RecursiveMode, Watcher};
+use pyo3::prelude::*;
+use pyo3::intern;
 use room_resolver::RoomResolver;
 use serde::Deserialize;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -154,6 +157,7 @@ struct AuthInfo<'a> {
 
 pub(crate) type ShareableDatabase = Arc<redb::Database>;
 
+#[pyclass]
 struct AppCtx {
     modules: WasmModules,
     modules_paths: Vec<PathBuf>,
@@ -217,10 +221,10 @@ impl AppCtx {
     }
 }
 
-#[derive(Clone)]
-struct App {
-    inner: Arc<Mutex<AppCtx>>,
-}
+// I bet there is a way to make this automatically apply??
+//fn to_pyerr(e: anyhow::Error) -> PyErr {
+    //pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+//}
 
 impl App {
     pub fn new(ctx: AppCtx) -> Self {
@@ -228,6 +232,11 @@ impl App {
             inner: Arc::new(Mutex::new(ctx)),
         }
     }
+}
+
+#[derive(Clone)]
+struct App {
+    inner: Arc<Mutex<AppCtx>>,
 }
 
 /// Try to handle a message assuming it's an `!admin` command.
@@ -552,6 +561,12 @@ async fn on_message(
             }
         }
 
+        let _parse_result = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+            let pih: Py<InputHandler> = py.import_bound("sys")?.getattr("app")?.extract()?;
+            let result = pih.borrow(py).parse(&content);
+            result
+        });
+
         Vec::new()
     })
     .await?;
@@ -695,6 +710,10 @@ async fn login_with_sso<'a>(
     Ok(auth.login_token(&info.login_token))
 }
 
+fn _testfun(input: &str) -> bool {
+    input == "happy"
+}
+
 /// Run the client for the given `BotConfig`.
 pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     let user_id = UserId::parse(config.user_id.clone())?;
@@ -808,6 +827,41 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         .user_id()
         .context("impossible state: missing user id for the logged in bot?")?;
 
+    // I don't think I can use the freethreaded stuff yet, but why not...
+    pyo3::prepare_freethreaded_python();
+
+    debug!("setting up app...");
+    let client_copy = client.clone();
+
+    let app_ctx = tokio::task::spawn_blocking(|| {
+        AppCtx::new(
+            client_copy,
+            config.modules_paths,
+            modules_config,
+            db,
+            config.admin_user_id,
+        )
+    })
+    .await??;
+
+    let app = App::new(app_ctx);
+
+    Python::with_gil(|py| -> PyResult<()> {
+        let core_module = PyModule::new_bound(py, "trinity")?;
+        input::trinity(py, &core_module)?;
+        py.import_bound("sys")?.getattr("modules")?.set_item("trinity", core_module)?;
+        let module = py.import_bound("plugin.knowledge")?;
+
+        let pih = Py::new(py, InputHandler::new())?;
+        py.import_bound("sys")?.setattr("app", pih)?;
+
+        module.call_method0(intern!(py, "init"))?;
+        Ok(())
+    })?;
+
+    //app.add_pattern(17, r"tuna! (?P<flavor>\w+)").await?;
+    //app.add_pattern(702, r"test (\w+) (?P<second>\w+)").await?;
+
     // An initial sync to set up state and so our bot doesn't respond to old
     // messages. If the `StateStore` finds saved state in the location given the
     // initial sync will be skipped in favor of loading state from the store
@@ -830,20 +884,6 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
             }
         }
     }
-
-    debug!("setting up app...");
-    let client_copy = client.clone();
-    let app_ctx = tokio::task::spawn_blocking(|| {
-        AppCtx::new(
-            client_copy,
-            config.modules_paths,
-            modules_config,
-            db,
-            config.admin_user_id,
-        )
-    })
-    .await??;
-    let app = App::new(app_ctx);
 
     let _watcher_guard = watcher(app.inner.clone()).await?;
 
