@@ -464,6 +464,10 @@ async fn wait_for_confirmation(sas: SasVerification, emoji: [Emoji; 7]) -> anyho
     Ok(())
 }
 
+fn py_input_handler(py: Python) -> PyResult<Py<InputHandler>> {
+    py.import_bound("sys")?.getattr("app")?.extract()
+}
+
 async fn on_message(
     ev: SyncRoomMessageEvent,
     mut room: Room,
@@ -562,7 +566,7 @@ async fn on_message(
         }
 
         let _parse_result = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
-            let pih: Py<InputHandler> = py.import_bound("sys")?.getattr("app")?.extract()?;
+            let pih = py_input_handler(py)?;
             let result = pih.borrow(py).parse(&content);
             result
         });

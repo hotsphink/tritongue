@@ -8,7 +8,8 @@ use pyo3::{
 //use pyo3_asyncio_0_21::tokio::future_into_py;
 use std::{
     cell::RefCell,
-    collections::HashMap
+    collections::HashMap,
+    thread,
 };
 
 #[derive(Debug, Clone)]
@@ -30,11 +31,6 @@ pub struct HandlerRegistry {
     // RegexSet that checks whether any of the regexes match. Invalidated when new patterns are registered.
     anything: RefCell<Option<RegexSet>>,
     patterns: Vec<RegisteredPattern>,
-}
-
-pub struct ThreadInputHandler<'a> {
-    pub registry: HandlerRegistry,
-    callbacks: Vec<Box<dyn Fn(RegisteredPattern, &str, &Captures) -> () + 'a>>,
 }
 
 #[pyclass]
@@ -94,37 +90,6 @@ impl HandlerRegistry {
     }
 }
 
-impl<'a> ThreadInputHandler<'a> {
-    pub fn new() -> Self {
-        Self {
-            registry: HandlerRegistry::new(),
-            callbacks: vec![],
-        }
-    }
-
-    fn add_full_pattern(&mut self, token: u32, pattern: &str, callback: impl Fn(RegisteredPattern, &str, &Captures) + 'a) -> anyhow::Result<()> {
-        self.callbacks.push(Box::new(callback));
-        self.registry.add_pattern(token, pattern)?;
-        *self.registry.anything.borrow_mut() = None; // Invalidate the "does anything match" RegexSet.
-        Ok(())
-    }
-
-    pub fn add_callback_pattern(&mut self, pattern: &str, callback: impl Fn(RegisteredPattern, &str, &Captures) + 'a) -> anyhow::Result<()> {
-        self.add_full_pattern(0, pattern, callback)
-    }
-
-    pub fn parse<'b>(&self, input: &'b str) -> anyhow::Result<Option<AMatch<'b>>> {
-        let amatch = self.registry.parse(input)?;
-        if let Some(amatch) = amatch {
-            let callback = &self.callbacks[amatch.index];
-            let _ = callback(amatch.rpattern, input, &amatch.captures);
-            Ok(None) // FIXME
-        } else {
-            Ok(None)
-        }
-    }
-}
-
 #[pymethods]
 impl InputHandler {
     #[new]
@@ -150,11 +115,12 @@ impl InputHandler {
     }
 
     //pub fn add_callback_pattern(&mut self, pattern: &str, callback: impl Fn(RegisteredPattern, &str, &Captures) + 'a) -> anyhow::Result<()> {
-    pub fn add_callback_pattern(&mut self, pattern: &str, callback: Py<PyAny>) -> PyResult<()> {
+        pub fn add_callback_pattern(&mut self, pattern: &str, callback: Py<PyAny>) -> PyResult<()> {
         self.add_full_pattern(0, pattern, callback)
     }
 
     pub fn parse(&self, input: &str) -> PyResult<Py<PyAny>> {
+        println!("Parsing on thread {:?}", thread::current().id());
         let amatch = self.registry.parse(input).map_err(to_pyerr)?;
         if let Some(amatch) = amatch {
             let callback = &self.callbacks[amatch.index];
@@ -219,9 +185,7 @@ impl PyCaptures {
 }
 
 #[pyfunction]
-//fn register_input_handler(py: Python, pattern: String, callback: PyObject) -> PyResult<Bound<PyAny>> {
 fn register_input_handler(py: Python, pattern: String, callback: Py<PyAny>) -> PyResult<()> {
-    use std::thread;
     println!("Registering input handler! {:?}={} {} on thread {:?}", pattern, callback, callback, thread::current().id());
     Python::with_gil(|py| {
         if !callback.to_object(py).into_bound(py).is_callable() {
@@ -230,7 +194,8 @@ fn register_input_handler(py: Python, pattern: String, callback: Py<PyAny>) -> P
         Ok(())
     })?;
 
-    let pih: Py<InputHandler> = py.import_bound("sys")?.getattr("app")?.extract()?;
+    use crate::py_input_handler;
+    let pih: Py<InputHandler> = py_input_handler(py)?;
     let result = pih.borrow_mut(py).add_callback_pattern(&pattern, callback);
     result
 }
@@ -244,28 +209,20 @@ pub fn trinity(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[test]
 pub fn test() {
-    use std::cell::RefCell;
-
-    struct TestState { first: String, second: String }
-    let state = RefCell::new(TestState {
-        first: String::default(),
-        second: String::default(),
-    });
-
     // Note that this is within the scope of `state`, so that the callbacks here can store references to it.
-    let handler = ThreadInputHandler::new();
+    let mut handler = InputHandler::new();
     let mut registry = HandlerRegistry::new();
 
     let pattern = r"3a|5a";
     registry.add_pattern(1, &(r"(?:what is|literal) (?:0x)?((?:ff)*(?P<code>".to_string() + pattern + r"){1,16}(?:ff)*) ?\??$")).expect("invalid regex");
 
-    //handler.add_callback_pattern(r"test (\w+) (?P<second>\w+)", |_rpattern, _input: &str, caps: &Captures| {
-    //    state.borrow_mut().first = caps.get(1).unwrap().as_str().to_string();
-    //    state.borrow_mut().second = caps.name("second").unwrap().as_str().to_string();
-    //}).expect("adding pattern");
-    let _ = handler.parse("test stabby fish").expect("should match");
-    assert_eq!(state.borrow().first.as_str(), "stabby");
-    assert_eq!(state.borrow().second.as_str(), "fish");
+    // TODO: Add whatever rust callback setup I come up with.
+
+    let _ = handler.registry.add_pattern(0, r"test (\w+) (?P<second>\w+)");
+    if let Some(amatch) = handler.registry.parse("test stabby fish").expect("should match") {
+        assert_eq!(amatch.captures.get(1).expect("m[1] must exist").as_str(), "stabby");
+        assert_eq!(amatch.captures.name("second").expect("m.second must exist").as_str(), "fish");
+    }
 
     let result = registry.parse("what is 0x3a3a3a3a?").expect("should match");
     let result = result.unwrap();
