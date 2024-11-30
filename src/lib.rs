@@ -23,8 +23,8 @@ use matrix_sdk::{
             },
         },
         presence::PresenceState,
-        OwnedUserId, RoomId, UserId,
-    },
+        OwnedUserId, RoomId, UserId, EventId,
+        },
     encryption::verification::{Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState},
     Client,
 };
@@ -221,6 +221,23 @@ impl AppCtx {
     }
 }
 
+impl AppCtx {
+    fn make_text_response(text: &str) -> AnyEvent {
+        let content = RoomMessageEventContent::text_plain(text);
+        AnyEvent::RoomMessage(content)
+    }
+
+    fn make_html_response(html: &str, text: &str) -> AnyEvent {
+        let content = RoomMessageEventContent::text_html(text, html);
+        AnyEvent::RoomMessage(content)
+    }
+
+    fn make_reaction(eid: &EventId, rxn: &str) -> AnyEvent {
+        let reaction = ReactionEventContent::new(Annotation::new(eid.to_owned(), rxn.to_owned()));
+        AnyEvent::Reaction(reaction)
+    }
+}
+
 // I bet there is a way to make this automatically apply??
 //fn to_pyerr(e: anyhow::Error) -> PyErr {
     //pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
@@ -372,6 +389,19 @@ impl AnyEvent {
         };
         Ok(())
     }
+
+    fn _from_text(text: &str) -> Self {
+        let content = RoomMessageEventContent::text_plain(text);
+        AnyEvent::RoomMessage(content)
+    }
+}
+
+#[derive(Clone)]
+#[pyclass]
+enum AnyEventPy {
+    RoomTextMessage { text: String },
+    RoomHtmlMessage { text: String, html: String },
+    RoomReaction { text: String }, // FIXME: event id
 }
 
 async fn on_verification_request(ev: ToDeviceKeyVerificationRequestEvent, client: Client) -> anyhow::Result<()> {
@@ -522,6 +552,8 @@ async fn on_message(
 
     let event_id = ev.event_id().to_owned();
 
+    let content_copy = content.clone();
+
     let new_actions = tokio::task::spawn_blocking(move || {
         let ctx = &mut *futures::executor::block_on(ctx.lock());
 
@@ -565,12 +597,6 @@ async fn on_message(
             }
         }
 
-        let _parse_result = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
-            let pih = py_input_handler(py)?;
-            let result = pih.borrow(py).parse(&content);
-            result
-        });
-
         Vec::new()
     })
     .await?;
@@ -596,6 +622,37 @@ async fn on_message(
 
     for event in new_events {
         event.send(&mut room).await?;
+    }
+
+    let content = content_copy;
+
+    // DOING: Why did the callback get invoked if the pattern didn't match??!
+    // Should handle getting back a PyNone instead of a PyList, as that happens when an exception is thrown at the very least.
+
+    let py_events: Result<Vec<AnyEventPy>, anyhow::Error> = Python::with_gil(|py| {
+        let pih = py_input_handler(py)?;
+        let result = pih.borrow(py).parse(&content)?;
+        use pyo3::types::PyList;
+        let list = result.bind(py).downcast::<PyList>();
+        let list = match list {
+            Ok(l) => l,
+            Err(e) => {
+                return Err(anyhow::anyhow!(e.to_string()));
+            }
+        };
+        let actions = list.iter().map(|elt| {
+            elt.extract().expect("FIXME")
+        }).collect();
+        Ok(actions)
+    });
+
+    for event in py_events? {
+        let action = match event {
+            AnyEventPy::RoomTextMessage { text: msg } => AppCtx::make_text_response(&msg),
+            AnyEventPy::RoomHtmlMessage { text: t, html: h } => AppCtx::make_html_response(&h, &t),
+            AnyEventPy::RoomReaction { text: rx } => AppCtx::make_reaction(&event_id, &rx),
+        };
+        action.send(&mut room).await?;
     }
 
     Ok(())

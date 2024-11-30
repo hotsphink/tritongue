@@ -3,7 +3,7 @@ use regex::{Captures, Regex, RegexSet};
 use pyo3::prelude::*;
 use pyo3::{
     exceptions::{PyAttributeError, PyRuntimeError, PyIndexError, PyTypeError},
-    types::PyTuple
+    types::PyTuple,
 };
 //use pyo3_asyncio_0_21::tokio::future_into_py;
 use std::{
@@ -101,7 +101,7 @@ impl InputHandler {
     }
 }
 
-fn to_pyerr(e: anyhow::Error) -> PyErr {
+pub fn to_pyerr(e: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -200,10 +200,18 @@ fn register_input_handler(py: Python, pattern: String, callback: Py<PyAny>) -> P
     result
 }
 
+#[pyfunction]
+fn make_text_response(py: Python, text: String) -> PyResult<Py<PyAny>> {
+    use crate::AnyEventPy;
+    let ev = AnyEventPy::RoomTextMessage { text };
+    Ok(Py::new(py, ev)?.as_any().to_owned())
+}
+
 #[pymodule]
 pub fn trinity(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     println!("running trinity!!!");
     m.add_function(wrap_pyfunction!(register_input_handler, m)?)?;
+    m.add_function(wrap_pyfunction!(make_text_response, m)?)?;
     Ok(())
 }
 
