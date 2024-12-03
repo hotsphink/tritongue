@@ -19,6 +19,7 @@ pub struct RegisteredPattern {
     token: u32,
 }
 
+#[derive(Debug)]
 pub struct AMatch<'a> {
     index: usize,
     rpattern: RegisteredPattern,
@@ -52,7 +53,7 @@ impl HandlerRegistry {
         self.patterns.push(RegisteredPattern {
             pattern: pattern.to_string(),
             regex: r,
-            token: token,
+            token,
         });
         *self.anything.borrow_mut() = None; // Invalidate the "does anything match" RegexSet.
         println!("added pattern {}, patterns now = {:?}", pattern, self.patterns);
@@ -72,13 +73,13 @@ impl HandlerRegistry {
     pub fn parse<'b>(&self, input: &'b str) -> anyhow::Result<Option<AMatch<'b>>> {
         self.ensure()?;
         let matches = self.anything.borrow().as_ref().unwrap().matches(input);
-        println!("matched against {:?}", self.anything.borrow().as_ref().unwrap());
+        println!("matched against {:?}: {:?}", self.anything.borrow().as_ref().unwrap(), matches);
         for index in matches {
             println!("Index {} matched!", index);
             let listener = &self.patterns[index];
             if let Some(caps) = listener.regex.captures(input) {
                 let amatch = AMatch {
-                    index: index,
+                    index,
                     rpattern: listener.clone(),
                     token: listener.token,
                     captures: caps,
@@ -86,7 +87,14 @@ impl HandlerRegistry {
                 return Ok(Some(amatch));
             }
         }
+        println!("no captures for any indexes found");
         Ok(None)
+    }
+}
+
+impl Default for HandlerRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -98,6 +106,12 @@ impl InputHandler {
             registry: HandlerRegistry::new(),
             callbacks: vec![],
         }
+    }
+}
+
+impl Default for InputHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -119,15 +133,16 @@ impl InputHandler {
         self.add_full_pattern(0, pattern, callback)
     }
 
-    pub fn parse(&self, input: &str) -> PyResult<Py<PyAny>> {
+    pub fn parse(&self, room: crate::WrappedRoom, input: &str) -> PyResult<Py<PyAny>> {
         println!("Parsing on thread {:?}", thread::current().id());
         let amatch = self.registry.parse(input).map_err(to_pyerr)?;
+        println!("Parsed: {:?}", amatch);
         if let Some(amatch) = amatch {
             let callback = &self.callbacks[amatch.index];
             let pycap = PyCaptures::new(amatch.rpattern, &amatch.captures);
             Python::with_gil(|py| {
                 let caps_arg = Py::new(py, pycap)?;
-                let args = PyTuple::new_bound(py, &[caps_arg]);
+                let args = PyTuple::new_bound(py, &[room.into_py(py), caps_arg.into_py(py)]);
                 callback.call_bound(py, args, None)
             })
         } else {
@@ -145,19 +160,14 @@ struct PyCaptures {
 impl PyCaptures {
     fn new(rpattern: RegisteredPattern, captures: &Captures) -> Self {
         let mut named = HashMap::new();
-        for name in rpattern.regex.capture_names() {
-            if let Some(name) = name {
-                let value = captures.name(name).unwrap().as_str().to_string();
-                named.insert(name.to_owned(), value);
-            }
+        for name in rpattern.regex.capture_names().flatten() {
+            let value = captures.name(name).unwrap().as_str().to_string();
+            named.insert(name.to_owned(), value);
         }
         let positional = captures.iter().map(|cap| {
             cap.map(|m| { m.as_str().to_owned()})
         }).collect();
-        Self {
-            positional: positional,
-            named: named,
-        }
+        Self { positional, named, }
     }
 }
 
@@ -209,9 +219,11 @@ fn make_text_response(py: Python, text: String) -> PyResult<Py<PyAny>> {
 
 #[pymodule]
 pub fn trinity(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    use crate::send_text;
     println!("running trinity!!!");
     m.add_function(wrap_pyfunction!(register_input_handler, m)?)?;
     m.add_function(wrap_pyfunction!(make_text_response, m)?)?;
+    m.add_function(wrap_pyfunction!(send_text, m)?)?;
     Ok(())
 }
 

@@ -31,7 +31,9 @@ use matrix_sdk::{
 use matrix_sdk_base::SessionMeta;
 use notify::{RecursiveMode, Watcher};
 use pyo3::prelude::*;
-use pyo3::intern;
+use pyo3::{intern, types::PyList};
+use pyo3_asyncio_0_21 as pyo3_asyncio;
+use pyo3_asyncio::tokio::into_future;
 use room_resolver::RoomResolver;
 use serde::Deserialize;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -236,6 +238,23 @@ impl AppCtx {
         let reaction = ReactionEventContent::new(Annotation::new(eid.to_owned(), rxn.to_owned()));
         AnyEvent::Reaction(reaction)
     }
+}
+
+#[pyfunction]
+pub fn send_text(py: Python, room: WrappedRoom, text: String) -> PyResult<Py<PyAny>> {
+    let future = async {
+        let content = RoomMessageEventContent::text_plain(text);
+        let _joinhandle = tokio::spawn(async move {
+            room.room.send(content).await.map_err(|e| {
+                println!("error sending: {}", e);
+            })
+        });
+        Ok(())
+    };
+
+    // There is probably a better way of doing this.
+    let dummy = pyo3_asyncio::tokio::future_into_py(py, future);
+    dummy.map(|bound| bound.unbind())
 }
 
 // I bet there is a way to make this automatically apply??
@@ -498,51 +517,33 @@ fn py_input_handler(py: Python) -> PyResult<Py<InputHandler>> {
     py.import_bound("sys")?.getattr("app")?.extract()
 }
 
-async fn on_message(
+#[pyfunction]
+fn _await_coro(coro: &Bound<'_, PyAny>) -> PyResult<()> {
+    let f = into_future(coro.clone())?;
+    pyo3_asyncio::tokio::run_until_complete(coro.clone(), async move {
+        f.await?;
+        Ok(())
+    })
+}
+
+fn is_awaitable(py: Python, obj: &Py<PyAny>) -> PyResult<bool> {
+    let inspect = py.import_bound("inspect")?;
+    let isawaitable = inspect.getattr("isawaitable")?;
+    isawaitable.call1((obj,))?.extract()
+}
+
+#[derive(Clone)]
+#[pyclass]
+pub struct WrappedRoom {
+    room: Room,
+}
+
+async fn on_message_for_wasm(
     ev: SyncRoomMessageEvent,
     mut room: Room,
-    client: Client,
+    content: &str,
     Ctx(ctx): Ctx<App>,
 ) -> anyhow::Result<()> {
-    if room.state() != RoomState::Joined {
-        // Ignore non-joined rooms events.
-        return Ok(());
-    }
-
-    if ev.sender() == client.user_id().unwrap() {
-        // Skip messages sent by the bot.
-        return Ok(());
-    }
-
-    if ev.as_original().is_none() {
-        trace!("redacted message");
-        return Ok(());
-    }
-
-    let unredacted = ev.as_original().unwrap();
-
-    let content = if let MessageType::Text(text) = &unredacted.content.msgtype {
-        text.body.to_string()
-    } else {
-        // Ignore other kinds of messages at the moment.
-        return Ok(());
-    };
-
-    // TEMPORARY: Switch back to trace!
-    info!(
-        "Received a message from {} in {}: {}",
-        ev.sender(),
-        room.display_name().await.unwrap(),
-        content,
-    );
-
-    if content.contains("you are a good boy") {
-        let reaction = ReactionEventContent::new(Annotation::new(ev.event_id().to_owned(), "👀".to_owned()));
-        room.send(reaction).await?;
-        let message = RoomMessageEventContent::text_html("thank you", "thank <a href='htts://aapx.org/'>you</a>");
-        room.send(message).await?;
-    }
-
     // TODO ohnoes, locking across other awaits is bad
     // TODO Use a lock-free data-structure for the list of modules + put locks in the module
     // internal implementation?
@@ -552,7 +553,7 @@ async fn on_message(
 
     let event_id = ev.event_id().to_owned();
 
-    let content_copy = content.clone();
+    let content = content.to_string();
 
     let new_actions = tokio::task::spawn_blocking(move || {
         let ctx = &mut *futures::executor::block_on(ctx.lock());
@@ -623,16 +624,43 @@ async fn on_message(
     for event in new_events {
         event.send(&mut room).await?;
     }
+    Ok(())
+}
 
-    let content = content_copy;
+async fn on_message_for_python(
+    ev: SyncRoomMessageEvent,
+    mut room: Room,
+    content: &str,
+) -> anyhow::Result<()> {
+    let event_id = ev.event_id().to_owned();
 
-    // DOING: Why did the callback get invoked if the pattern didn't match??!
-    // Should handle getting back a PyNone instead of a PyList, as that happens when an exception is thrown at the very least.
-
+    let wroom = WrappedRoom { room: room.clone() };
     let py_events: Result<Vec<AnyEventPy>, anyhow::Error> = Python::with_gil(|py| {
         let pih = py_input_handler(py)?;
-        let result = pih.borrow(py).parse(&content)?;
-        use pyo3::types::PyList;
+        let result = pih.borrow(py).parse(wroom, content)?;
+        if result.is_none(py) {
+            // Matched nothing or threw an exception?
+            return Ok(vec!());
+        }
+
+        // This is the uncomfortable compromise state I ended up in: anything using this is basically single-threaded.
+        // If I'm understanding correctly, we grab the GIL, start up an event loop, and run all Python async stuff within that loop.
+        if is_awaitable(py, &result)? {
+            let coro_result = pyo3_asyncio::tokio::run(py, async move {
+                Python::with_gil(|py| {
+                    into_future(result.bind(py).clone()).expect("FIXME input_future failed")
+                }).await
+            });
+            if let Err(e) = coro_result {
+                e.print(py);
+                return Err(anyhow::Error::msg(e.to_string()));
+            }
+            let result = coro_result.unwrap();
+            println!("coro result is {:?}", result.bind(py));
+            // Discard async result, for now at least. Maybe I'll figure out something useful to do with it.
+            return Ok(vec!())
+        }
+
         let list = result.bind(py).downcast::<PyList>();
         let list = match list {
             Ok(l) => l,
@@ -654,6 +682,65 @@ async fn on_message(
         };
         action.send(&mut room).await?;
     }
+
+    Ok(())
+}
+
+async fn on_message(
+    ev: SyncRoomMessageEvent,
+    room: Room,
+    client: Client,
+    Ctx(ctx): Ctx<App>,
+) -> anyhow::Result<()> {
+    if room.state() != RoomState::Joined {
+        // Ignore non-joined rooms events.
+        return Ok(());
+    }
+
+    if ev.sender() == client.user_id().unwrap() {
+        // Skip messages sent by the bot.
+        return Ok(());
+    }
+
+    if ev.as_original().is_none() {
+        trace!("redacted message");
+        return Ok(());
+    }
+
+    let unredacted = ev.as_original().unwrap();
+
+    let content = if let MessageType::Text(text) = &unredacted.content.msgtype {
+        text.body.to_string()
+    } else {
+        // Ignore other kinds of messages at the moment.
+        return Ok(());
+    };
+
+    // TEMPORARY: Switch back to trace!
+    info!(
+        "Received a message from {} in {}: {}",
+        ev.sender(),
+        room.display_name().await.unwrap(),
+        content,
+    );
+
+    if content.contains("you are a good boy") {
+        let reaction = ReactionEventContent::new(Annotation::new(ev.event_id().to_owned(), "👀".to_owned()));
+        room.send(reaction).await?;
+        let message = RoomMessageEventContent::text_html("thank you", "thank <a href='htts://aapx.org/'>you</a>");
+        room.send(message).await?;
+    }
+
+    let ev1 = ev.clone();
+    let room1 = room.clone();
+    let content1 = content.to_string();
+    tokio::task::spawn(async move {
+        on_message_for_wasm(ev1, room1, &content1, Ctx(ctx)).await
+    }).await??;
+
+    tokio::task::spawn(async move {
+        on_message_for_python(ev, room, &content).await
+    }).await??;
 
     Ok(())
 }
