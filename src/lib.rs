@@ -1,13 +1,15 @@
 mod admin_table;
 pub mod input;
+
+#[cfg(feature = "wasm")]
 mod room_resolver;
+#[cfg(feature = "wasm")]
 mod wasm;
 
 use anyhow::{Context, bail};
 use input::InputHandler;
 use matrix_sdk::{
     config::SyncSettings,
-    event_handler::Ctx,
     matrix_auth::{MatrixAuth, MatrixSession, MatrixSessionTokens, LoginBuilder},
     room::Room,
     RoomState,
@@ -23,30 +25,43 @@ use matrix_sdk::{
             },
         },
         presence::PresenceState,
-        OwnedUserId, RoomId, UserId, EventId,
+        OwnedUserId, UserId, EventId,
         },
     encryption::verification::{Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState},
     Client,
 };
 use matrix_sdk_base::SessionMeta;
-use notify::{RecursiveMode, Watcher};
 use pyo3::prelude::*;
 use pyo3::{intern, types::PyList};
 use pyo3_asyncio_0_21 as pyo3_asyncio;
 use pyo3_asyncio::tokio::into_future;
-use room_resolver::RoomResolver;
 use serde::Deserialize;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::Mutex,
     time::{sleep, Duration},
 };
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info, trace, warn};
-use wasm::{GuestState, Module, WasmModules};
+
+#[cfg(feature = "wasm")]
+mod wasm_imports {
+    pub use wasm::{GuestState, Module, WasmModules};
+    pub use matrix_sdk::{
+        event_handler::Ctx,
+        ruma::RoomId,
+    };
+    use notify::{RecursiveMode, Watcher};
+    use room_resolver::RoomResolver;
+    use tokio::sync::Mutex;
+}
+
+#[cfg(feature = "wasm")]
+use wasm_imports::*;
+
+use std::thread;
 
 use crate::admin_table::DEVICE_ID_ENTRY;
 
@@ -159,6 +174,7 @@ struct AuthInfo<'a> {
 
 pub(crate) type ShareableDatabase = Arc<redb::Database>;
 
+#[cfg(feature = "wasm")]
 #[pyclass]
 struct AppCtx {
     modules: WasmModules,
@@ -170,6 +186,7 @@ struct AppCtx {
     room_resolver: RoomResolver,
 }
 
+#[cfg(feature = "wasm")]
 impl AppCtx {
     /// Create a new `AppCtx`.
     ///
@@ -223,6 +240,7 @@ impl AppCtx {
     }
 }
 
+#[cfg(feature = "wasm")]
 impl AppCtx {
     fn make_text_response(text: &str) -> AnyEvent {
         let content = RoomMessageEventContent::text_plain(text);
@@ -262,6 +280,7 @@ pub fn send_text(py: Python, room: WrappedRoom, text: String) -> PyResult<Py<PyA
     //pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 //}
 
+#[cfg(feature = "wasm")]
 impl App {
     pub fn new(ctx: AppCtx) -> Self {
         Self {
@@ -270,12 +289,14 @@ impl App {
     }
 }
 
+#[cfg(feature = "wasm")]
 #[derive(Clone)]
 struct App {
     inner: Arc<Mutex<AppCtx>>,
 }
 
 /// Try to handle a message assuming it's an `!admin` command.
+#[cfg(feature = "wasm")]
 fn try_handle_admin<'a>(
     content: &str,
     sender: &UserId,
@@ -332,6 +353,7 @@ fn try_handle_admin<'a>(
     }
 }
 
+#[cfg(feature = "wasm")]
 fn try_handle_help<'a>(
     content: &str,
     sender: &UserId,
@@ -409,9 +431,19 @@ impl AnyEvent {
         Ok(())
     }
 
-    fn _from_text(text: &str) -> Self {
+    fn from_text(text: &str) -> Self {
         let content = RoomMessageEventContent::text_plain(text);
         AnyEvent::RoomMessage(content)
+    }
+
+    fn from_html(html: &str, text: &str) -> Self {
+        let content = RoomMessageEventContent::text_html(text, html);
+        AnyEvent::RoomMessage(content)
+    }
+
+    fn reaction_from(eid: &EventId, reaction: &str) -> Self {
+        let reaction = ReactionEventContent::new(Annotation::new(eid.to_owned(), reaction.to_owned()));
+        AnyEvent::Reaction(reaction)
     }
 }
 
@@ -538,6 +570,7 @@ pub struct WrappedRoom {
     room: Room,
 }
 
+#[cfg(feature = "wasm")]
 async fn on_message_for_wasm(
     ev: SyncRoomMessageEvent,
     mut room: Room,
@@ -634,6 +667,7 @@ async fn on_message_for_python(
 ) -> anyhow::Result<()> {
     let event_id = ev.event_id().to_owned();
 
+    use std::thread;
     let wroom = WrappedRoom { room: room.clone() };
     let py_events: Result<Vec<AnyEventPy>, anyhow::Error> = Python::with_gil(|py| {
         let pih = py_input_handler(py)?;
@@ -676,9 +710,9 @@ async fn on_message_for_python(
 
     for event in py_events? {
         let action = match event {
-            AnyEventPy::RoomTextMessage { text: msg } => AppCtx::make_text_response(&msg),
-            AnyEventPy::RoomHtmlMessage { text: t, html: h } => AppCtx::make_html_response(&h, &t),
-            AnyEventPy::RoomReaction { text: rx } => AppCtx::make_reaction(&event_id, &rx),
+            AnyEventPy::RoomTextMessage { text: msg } => AnyEvent::from_text(&msg),
+            AnyEventPy::RoomHtmlMessage { text: t, html: h } => AnyEvent::from_html(&h, &t),
+            AnyEventPy::RoomReaction { text: rx } => AnyEvent::reaction_from(&event_id, &rx),
         };
         action.send(&mut room).await?;
     }
@@ -690,6 +724,7 @@ async fn on_message(
     ev: SyncRoomMessageEvent,
     room: Room,
     client: Client,
+    #[cfg(feature = "wasm")]
     Ctx(ctx): Ctx<App>,
 ) -> anyhow::Result<()> {
     if room.state() != RoomState::Joined {
@@ -731,16 +766,19 @@ async fn on_message(
         room.send(message).await?;
     }
 
-    let ev1 = ev.clone();
-    let room1 = room.clone();
-    let content1 = content.to_string();
-    tokio::task::spawn(async move {
-        on_message_for_wasm(ev1, room1, &content1, Ctx(ctx)).await
-    }).await??;
+    #[cfg(feature = "wasm")]
+    {
+        let ev1 = ev.clone();
+        let room1 = room.clone();
+        let content1 = content.to_string();
+        let _joinhandle = tokio::task::spawn(async move {
+            on_message_for_wasm(ev1, room1, &content1, Ctx(ctx)).await
+        });
+    }
 
-    tokio::task::spawn(async move {
+    let _joinhandle = tokio::task::spawn(async move {
         on_message_for_python(ev, room, &content).await
-    }).await??;
+    });
 
     Ok(())
 }
@@ -969,6 +1007,7 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         client.restore_session(session).await?;
     }
 
+    #[cfg(feature = "wasm")]
     let modules_config = config.modules_config.unwrap_or_default();
 
     client
@@ -979,8 +1018,10 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     pyo3::prepare_freethreaded_python();
 
     debug!("setting up app...");
-    let client_copy = client.clone();
 
+    #[cfg(feature = "wasm")]
+    let client_copy = client.clone();
+    #[cfg(feature = "wasm")]
     let app_ctx = tokio::task::spawn_blocking(|| {
         AppCtx::new(
             client_copy,
@@ -992,6 +1033,7 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     })
     .await??;
 
+    #[cfg(feature = "wasm")]
     let app = App::new(app_ctx);
 
     Python::with_gil(|py| -> PyResult<()> {
@@ -1006,9 +1048,6 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         module.call_method0(intern!(py, "init"))?;
         Ok(())
     })?;
-
-    //app.add_pattern(17, r"tuna! (?P<flavor>\w+)").await?;
-    //app.add_pattern(702, r"test (\w+) (?P<second>\w+)").await?;
 
     // An initial sync to set up state and so our bot doesn't respond to old
     // messages. If the `StateStore` finds saved state in the location given the
@@ -1033,11 +1072,14 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         }
     }
 
+    // TODO: Reuse the app watcher stuff for python.
+    #[cfg(feature = "wasm")]
     let _watcher_guard = watcher(app.inner.clone()).await?;
 
     println!("ACCESS TOKEN FOR SKIPPING LOGIN WHEN RESTARTING (put this in config.toml): {:?}", client.access_token().unwrap());
 
     debug!("setup ready! now listening to incoming messages.");
+    #[cfg(feature = "wasm")]
     client.add_event_handler_context(app);
     client.add_event_handler(on_message);
     client.add_event_handler(on_stripped_state_member);
@@ -1090,6 +1132,7 @@ async fn handle_signals() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "wasm")]
 async fn watcher(app: Arc<Mutex<AppCtx>>) -> anyhow::Result<Vec<notify::RecommendedWatcher>> {
     let modules_paths = { app.lock().await.modules_paths.clone() };
 

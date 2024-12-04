@@ -11,6 +11,11 @@ path = "src/lib.rs"
 name = "tritongue"
 path = "src/bin/main.rs"
 
+[features]
+default = ["python"]
+wasm = ["dep:wasmtime"]
+python = ["dep:pyo3", "dep:pyo3-ffi", "dep:pyo3-asyncio-0-21"]
+
 [dependencies]
 anyhow = "1.0.66"
 directories = "5.0.1"
@@ -34,7 +39,7 @@ tokio-util = "^0.7"
 toml = "0.5.10"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
-wasmtime = { version = "14.0.0", features = ["component-model"] }
-pyo3-asyncio-0-21 = { version="^0.21", features = ["attributes", "tokio-runtime"] }
-pyo3 = { version="^0.21", features = [ "auto-initialize" ] }
-pyo3-ffi = "^0.21"
+wasmtime = { version = "14.0.0", features = ["component-model"], optional = true }
+pyo3-asyncio-0-21 = { version="^0.21", features = ["attributes", "tokio-runtime"], optional = true }
+pyo3 = { version = "^0.21", features = [ "auto-initialize" ], optional = true }
+pyo3-ffi = { version = "^0.21", optional = true }
