@@ -3,3 +3,5 @@ target/
 trinity.db
 cache/
 data/
+old-*/
+__pycache__/

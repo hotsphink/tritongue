@@ -89,6 +89,9 @@ pub struct BotConfig {
     pub modules_paths: Vec<PathBuf>,
     /// module specific configuration to forward to corresponding handler.
     pub modules_config: Option<HashMap<String, HashMap<String, String>>>,
+
+    /// root of python modules.
+    pub python_path: Option<PathBuf>,
 }
 
 impl BotConfig {
@@ -162,6 +165,7 @@ impl BotConfig {
             redb_path,
             modules_paths,
             modules_config: None,
+            python_path: None,
         })
     }
 }
@@ -902,6 +906,11 @@ fn _testfun(input: &str) -> bool {
 
 /// Run the client for the given `BotConfig`.
 pub async fn run(config: BotConfig) -> anyhow::Result<()> {
+    // WARNING! This assumes we are on the main thread and have not started any other threads yet.
+    if config.python_path.is_some() {
+        std::env::set_var(&"PYTHONPATH", config.python_path.unwrap())
+    }
+
     let user_id = UserId::parse(config.user_id.clone())?;
     let base_dir = if let Some(dir) = dirs::data_dir() {
         dir
