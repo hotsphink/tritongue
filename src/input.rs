@@ -17,6 +17,7 @@ pub struct RegisteredPattern {
     regex: Regex,
     pattern: String,
     token: u32,
+    defaults: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -48,12 +49,13 @@ impl HandlerRegistry {
         }
     }
 
-    pub fn add_pattern(&mut self, token: u32, pattern: &str) -> anyhow::Result<()> {
+    pub fn add_pattern(&mut self, token: u32, pattern: &str, defaults: Option<HashMap<String, String>>) -> anyhow::Result<()> {
         let r = Regex::new(pattern)?;
         self.patterns.push(RegisteredPattern {
             pattern: pattern.to_string(),
             regex: r,
             token,
+            defaults: defaults.unwrap_or_default(),
         });
         *self.anything.borrow_mut() = None; // Invalidate the "does anything match" RegexSet.
         println!("added pattern {}, patterns now = {:?}", pattern, self.patterns);
@@ -121,28 +123,30 @@ pub fn to_pyerr(e: anyhow::Error) -> PyErr {
 
 impl InputHandler {
     //fn add_full_pattern(&mut self, token: u32, pattern: &str, callback: impl Fn(RegisteredPattern, &str, &Captures) + 'a) -> anyhow::Result<()> {
-    fn add_full_pattern(&mut self, token: u32, pattern: &str, callback: Py<PyAny>) -> PyResult<()> {
+    fn add_full_pattern(&mut self, token: u32, pattern: &str, callback: Py<PyAny>, defaults: Option<HashMap<String, String>>) -> PyResult<()> {
         self.callbacks.push(callback);
-        self.registry.add_pattern(token, pattern).map_err(to_pyerr)?;
+        self.registry.add_pattern(token, pattern, defaults).map_err(to_pyerr)?;
         *self.registry.anything.borrow_mut() = None; // Invalidate the "does anything match" RegexSet.
         Ok(())
     }
 
     //pub fn add_callback_pattern(&mut self, pattern: &str, callback: impl Fn(RegisteredPattern, &str, &Captures) + 'a) -> anyhow::Result<()> {
-        pub fn add_callback_pattern(&mut self, pattern: &str, callback: Py<PyAny>) -> PyResult<()> {
-        self.add_full_pattern(0, pattern, callback)
+        pub fn add_callback_pattern(&mut self, pattern: &str, callback: Py<PyAny>, defaults: Option<HashMap<String, String>>) -> PyResult<()> {
+        self.add_full_pattern(0, pattern, callback, defaults)
     }
 
     pub fn parse(&self, room: crate::WrappedRoom, input: &str) -> PyResult<Py<PyAny>> {
         println!("Parsing on thread {:?}", thread::current().id());
         let amatch = self.registry.parse(input).map_err(to_pyerr)?;
-        println!("Parsed: {:?}", amatch);
+        // println!("Parsed: {:?}", amatch);
         if let Some(amatch) = amatch {
             let callback = &self.callbacks[amatch.index];
-            let pycap = PyCaptures::new(amatch.rpattern, &amatch.captures);
+            let mut pycap = PyCaptures::new(&amatch.rpattern, &amatch.captures);
+            pycap.named.extend(amatch.rpattern.defaults);
             Python::with_gil(|py| {
                 let caps_arg = Py::new(py, pycap)?;
                 let args = PyTuple::new_bound(py, &[room.into_py(py), caps_arg.into_py(py)]);
+                println!("invoking callback {:?}", callback.bind(py));
                 callback.call_bound(py, args, None)
             })
         } else {
@@ -151,6 +155,7 @@ impl InputHandler {
     }
 }
 
+#[derive(Clone)]
 #[pyclass]
 struct PyCaptures {
     positional: Vec<Option<String>>,
@@ -158,7 +163,7 @@ struct PyCaptures {
 }
 
 impl PyCaptures {
-    fn new(rpattern: RegisteredPattern, captures: &Captures) -> Self {
+    fn new(rpattern: &RegisteredPattern, captures: &Captures) -> Self {
         let mut named = HashMap::new();
         for name in rpattern.regex.capture_names().flatten() {
             let value = captures.name(name).unwrap().as_str().to_string();
@@ -195,8 +200,8 @@ impl PyCaptures {
 }
 
 #[pyfunction]
-fn register_input_handler(py: Python, pattern: String, callback: Py<PyAny>) -> PyResult<()> {
-    println!("Registering input handler! {:?}={} {} on thread {:?}", pattern, callback, callback, thread::current().id());
+fn register_input_handler(py: Python, pattern: String, callback: Py<PyAny>, defaults: Option<HashMap<String, String>>) -> PyResult<()> {
+    println!("Registering input handler! {:?}={} on thread {:?}", pattern, callback, thread::current().id());
     Python::with_gil(|py| {
         if !callback.to_object(py).into_bound(py).is_callable() {
             return Err(PyTypeError::new_err("Expected a callable object"));
@@ -206,7 +211,7 @@ fn register_input_handler(py: Python, pattern: String, callback: Py<PyAny>) -> P
 
     use crate::py_input_handler;
     let pih: Py<InputHandler> = py_input_handler(py)?;
-    let result = pih.borrow_mut(py).add_callback_pattern(&pattern, callback);
+    let result = pih.borrow_mut(py).add_callback_pattern(&pattern, callback, defaults);
     result
 }
 
@@ -234,11 +239,11 @@ pub fn test() {
     let mut registry = HandlerRegistry::new();
 
     let pattern = r"3a|5a";
-    registry.add_pattern(1, &(r"(?:what is|literal) (?:0x)?((?:ff)*(?P<code>".to_string() + pattern + r"){1,16}(?:ff)*) ?\??$")).expect("invalid regex");
+    registry.add_pattern(1, &(r"(?:what is|literal) (?:0x)?((?:ff)*(?P<code>".to_string() + pattern + r"){1,16}(?:ff)*) ?\??$"), None).expect("invalid regex");
 
     // TODO: Add whatever rust callback setup I come up with.
 
-    let _ = handler.registry.add_pattern(0, r"test (\w+) (?P<second>\w+)");
+    let _ = handler.registry.add_pattern(0, r"test (\w+) (?P<second>\w+)", None);
     if let Some(amatch) = handler.registry.parse("test stabby fish").expect("should match") {
         assert_eq!(amatch.captures.get(1).expect("m[1] must exist").as_str(), "stabby");
         assert_eq!(amatch.captures.name("second").expect("m.second must exist").as_str(), "fish");

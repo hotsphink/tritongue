@@ -61,8 +61,6 @@ mod wasm_imports {
 #[cfg(feature = "wasm")]
 use wasm_imports::*;
 
-use std::thread;
-
 use crate::admin_table::DEVICE_ID_ENTRY;
 
 /// The configuration to run a trinity instance with.
@@ -671,7 +669,6 @@ async fn on_message_for_python(
 ) -> anyhow::Result<()> {
     let event_id = ev.event_id().to_owned();
 
-    use std::thread;
     let wroom = WrappedRoom { room: room.clone() };
     let py_events: Result<Vec<AnyEventPy>, anyhow::Error> = Python::with_gil(|py| {
         let pih = py_input_handler(py)?;
@@ -908,7 +905,7 @@ fn _testfun(input: &str) -> bool {
 pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     // WARNING! This assumes we are on the main thread and have not started any other threads yet.
     if config.python_path.is_some() {
-        std::env::set_var(&"PYTHONPATH", config.python_path.unwrap())
+        std::env::set_var("PYTHONPATH", config.python_path.as_ref().unwrap());
     }
 
     let user_id = UserId::parse(config.user_id.clone())?;
@@ -1049,7 +1046,7 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
         let core_module = PyModule::new_bound(py, "trinity")?;
         input::trinity(py, &core_module)?;
         py.import_bound("sys")?.getattr("modules")?.set_item("trinity", core_module)?;
-        let module = py.import_bound("plugin.knowledge")?;
+        let module = py.import_bound("plugins")?;
 
         let pih = Py::new(py, InputHandler::new())?;
         py.import_bound("sys")?.setattr("app", pih)?;
