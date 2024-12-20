@@ -25,7 +25,7 @@ use matrix_sdk::{
             },
         },
         presence::PresenceState,
-        OwnedUserId, UserId, EventId,
+        OwnedUserId, UserId, OwnedEventId, EventId,
         },
     encryption::verification::{Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState},
     Client,
@@ -264,6 +264,40 @@ impl AppCtx {
 pub fn send_text(py: Python, room: WrappedRoom, text: String) -> PyResult<Py<PyAny>> {
     let future = async {
         let content = RoomMessageEventContent::text_plain(text);
+        let _joinhandle = tokio::spawn(async move {
+            room.room.send(content).await.map_err(|e| {
+                println!("error sending: {}", e);
+            })
+        });
+        Ok(())
+    };
+
+    // There is probably a better way of doing this.
+    let dummy = pyo3_asyncio::tokio::future_into_py(py, future);
+    dummy.map(|bound| bound.unbind())
+}
+
+#[pyfunction]
+pub fn send_html(py: Python, room: WrappedRoom, html: String, text: String) -> PyResult<Py<PyAny>> {
+    let future = async {
+        let content = RoomMessageEventContent::text_html(text, html);
+        let _joinhandle = tokio::spawn(async move {
+            room.room.send(content).await.map_err(|e| {
+                println!("error sending: {}", e);
+            })
+        });
+        Ok(())
+    };
+
+    // There is probably a better way of doing this.
+    let dummy = pyo3_asyncio::tokio::future_into_py(py, future);
+    dummy.map(|bound| bound.unbind())
+}
+
+#[pyfunction]
+pub fn react(py: Python, room: WrappedRoom, eid: WrappedEventId, reaction: String) -> PyResult<Py<PyAny>> {
+    let content = ReactionEventContent::new(Annotation::new((*eid.event_id).clone(), reaction.to_owned()));
+    let future = async {
         let _joinhandle = tokio::spawn(async move {
             room.room.send(content).await.map_err(|e| {
                 println!("error sending: {}", e);
@@ -572,6 +606,12 @@ pub struct WrappedRoom {
     room: Room,
 }
 
+#[derive(Clone)]
+#[pyclass]
+pub struct WrappedEventId {
+    event_id: Arc<OwnedEventId>,
+}
+
 #[cfg(feature = "wasm")]
 async fn on_message_for_wasm(
     ev: SyncRoomMessageEvent,
@@ -672,14 +712,12 @@ async fn on_message_for_python(
     let wroom = WrappedRoom { room: room.clone() };
     let py_events: Result<Vec<AnyEventPy>, anyhow::Error> = Python::with_gil(|py| {
         let pih = py_input_handler(py)?;
-        let result = pih.borrow(py).parse(wroom, content)?;
+        let result = pih.borrow(py).parse(wroom, &ev.event_id(), content)?;
         if result.is_none(py) {
             // Matched nothing or threw an exception?
             return Ok(vec!());
         }
 
-        // This is the uncomfortable compromise state I ended up in: anything using this is basically single-threaded.
-        // If I'm understanding correctly, we grab the GIL, start up an event loop, and run all Python async stuff within that loop.
         if is_awaitable(py, &result)? {
             let coro_result = pyo3_asyncio::tokio::run(py, async move {
                 Python::with_gil(|py| {

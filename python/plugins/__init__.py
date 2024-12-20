@@ -56,9 +56,9 @@ class Plugin(object):
                                   ("private_command_{cmd}", True)]:
                 name = pat.format(cmd=spec['command'])
                 if func := getattr(self, name):
-                    async def wrapped_func(room, caps, func=func):
+                    async def wrapped_func(room, event_id, caps, func=func):
                         #print(f"called wrapped_func(self={self}, room={room}, caps={list(caps)}), func={func}")
-                        result = await func(room, caps)
+                        result = await func(room, event_id, caps)
                         await self.proto.process_message(room, result)
 
                     trinity.register_input_handler(spec['pattern'], wrapped_func, spec.get('defaults'))

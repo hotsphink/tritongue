@@ -5,6 +5,7 @@ use pyo3::{
     exceptions::{PyAttributeError, PyRuntimeError, PyIndexError, PyTypeError},
     types::PyTuple,
 };
+use std::sync::Arc;
 //use pyo3_asyncio_0_21::tokio::future_into_py;
 use std::{
     cell::RefCell,
@@ -135,7 +136,7 @@ impl InputHandler {
         self.add_full_pattern(0, pattern, callback, defaults)
     }
 
-    pub fn parse(&self, room: crate::WrappedRoom, input: &str) -> PyResult<Py<PyAny>> {
+    pub fn parse(&self, room: crate::WrappedRoom, event_id: &crate::EventId, input: &str) -> PyResult<Py<PyAny>> {
         println!("Parsing on thread {:?}", thread::current().id());
         let amatch = self.registry.parse(input).map_err(to_pyerr)?;
         // println!("Parsed: {:?}", amatch);
@@ -145,7 +146,8 @@ impl InputHandler {
             pycap.named.extend(amatch.rpattern.defaults);
             Python::with_gil(|py| {
                 let caps_arg = Py::new(py, pycap)?;
-                let args = PyTuple::new_bound(py, &[room.into_py(py), caps_arg.into_py(py)]);
+                let pyevent_id = crate::WrappedEventId { event_id: Arc::new(event_id.to_owned()) };
+                let args = PyTuple::new_bound(py, &[room.into_py(py), pyevent_id.into_py(py), caps_arg.into_py(py)]);
                 println!("invoking callback {:?}", callback.bind(py));
                 callback.call_bound(py, args, None)
             })
@@ -224,11 +226,13 @@ fn make_text_response(py: Python, text: String) -> PyResult<Py<PyAny>> {
 
 #[pymodule]
 pub fn trinity(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    use crate::send_text;
+    use crate::{send_text, send_html, react};
     println!("running trinity!!!");
     m.add_function(wrap_pyfunction!(register_input_handler, m)?)?;
     m.add_function(wrap_pyfunction!(make_text_response, m)?)?;
     m.add_function(wrap_pyfunction!(send_text, m)?)?;
+    m.add_function(wrap_pyfunction!(send_html, m)?)?;
+    m.add_function(wrap_pyfunction!(react, m)?)?;
     Ok(())
 }
 

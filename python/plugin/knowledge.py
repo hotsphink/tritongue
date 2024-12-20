@@ -467,11 +467,13 @@ it is the symptom when you mark a Cell (thus moving it) and then access it throu
         return s + ", commented as: " + comment
 
     #def command_whathex(self, query, channel, **kwargs):
-    async def command_whathex(self, room, caps):
+    async def command_whathex(self, room, event_id, caps):
         '''explain what a hexadecimal value means'''
 
         magic = caps.magic.lower()
         number = caps.original.lower()
+
+        trinity.react(room, event_id, "OO")
 
         if magic in self.KNOWLEDGE:
             return self.whatpoison(magic, number)
