@@ -1,3 +1,12 @@
+# [ ] call extract_from_source
+# [ ] poll extract_from_source?
+# [ ] make a way to invoke commands explicitly, with args
+# [ ] make some sort of interface class to go through
+# [ ] @pattern
+# [x] @command(private=False)
+# [ ] @usage(func that takes provided args)
+# [ ] help() - minimal, one liner, full
+
 import asyncio
 import os
 import plugins
@@ -466,14 +475,14 @@ it is the symptom when you mark a Cell (thus moving it) and then access it throu
             return s + ", commented as:\n" + comment
         return s + ", commented as: " + comment
 
-    #def command_whathex(self, query, channel, **kwargs):
     async def command_whathex(self, room, event_id, caps):
         '''explain what a hexadecimal value means'''
 
         magic = caps.magic.lower()
         number = caps.original.lower()
 
-        trinity.react(room, event_id, "OO")
+        # TEMPORARY! For testing.
+        await trinity.react(room, event_id, "👀")
 
         if magic in self.KNOWLEDGE:
             return self.whatpoison(magic, number)
@@ -491,17 +500,16 @@ it is the symptom when you mark a Cell (thus moving it) and then access it throu
             if punbox64:
                 return "(as PUNBOX64) %s" % (punbox64,)
 
-    def command_to_punbox64(self, rest, channel, **kwargs):
+    async def command_to_punbox64(self, _room, _event_id, caps):
         '''Convert SomeValue(foo) to a PUNBOX64 hex string'''
-        desc = kwargs.get('desc', rest)
-        p = string_to_punbox64(desc)
+        p = string_to_punbox64(caps.desc)
         if p is None:
-            return "I don't know how to convert %s to punbox64 format" % (desc,)
+            return "I don't know how to convert %s to punbox64 format" % (caps.desc,)
         return p
 
-    def command_whatchar(self, query, channel, **kwargs):
+    async def command_whatchar(self, _room, _event_id, caps):
         '''Convert a character to its unicode name'''
-        return "looks like unicode \\N{" + unicodedata.name(kwargs.get('char', query)) + "}"
+        return "looks like unicode \\N{" + unicodedata.name(caps.char) + "}"
 
     def command_cconv(self, query, channel, **kwargs):
         '''Describe calling conventions'''
@@ -569,9 +577,9 @@ it is the symptom when you mark a Cell (thus moving it) and then access it throu
         modnum = ((nsresult & 0x7fffffff) >> 16) - 0x45
         return nsresult_number_to_module.get(modnum)
 
-    def command_what(self, query, channel, **kwargs):
+    def command_what(self, room, event_id, caps):
         '''Look up various bits of info'''
-        key = kwargs.get('thing', query)
+        key = caps.thing
         if key in nsresult_code_to_number:
             num = nsresult_code_to_number[key]
             s = '%s is 0x%x' % (key, num)
@@ -631,7 +639,7 @@ def init():
     print("Initializating knowledge plugin")
     print("trinity = " + str(trinity))
     # print("trinity.app = " + str(trinity.app))
-    trinity.register_input_handler(r"gwoink (\w+) (?P<rest>.*)", call_me_back)
-    trinity.register_input_handler(r"async (?P<rest>.*)", secondary)
+    trinity.register_input_handler("gwoink", r"gwoink (\w+) (?P<rest>.*)", call_me_back)
+    trinity.register_input_handler("async", r"async (?P<rest>.*)", secondary)
 
 print("Loaindg moduel?")
