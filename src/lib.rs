@@ -311,6 +311,24 @@ pub fn react(py: Python, room: WrappedRoom, eid: WrappedEventId, reaction: Strin
     dummy.map(|bound| bound.unbind())
 }
 
+#[pyfunction]
+fn make_text_response(py: Python, text: String) -> PyResult<Py<PyAny>> {
+    use crate::AnyEventPy;
+    let ev = AnyEventPy::RoomTextMessage { text };
+    Ok(Py::new(py, ev)?.as_any().to_owned())
+}
+
+#[pymodule]
+pub fn trinity(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    println!("running trinity!!!");
+    m.add_function(wrap_pyfunction!(input::register_input_handler, m)?)?;
+    m.add_function(wrap_pyfunction!(make_text_response, m)?)?;
+    m.add_function(wrap_pyfunction!(send_text, m)?)?;
+    m.add_function(wrap_pyfunction!(send_html, m)?)?;
+    m.add_function(wrap_pyfunction!(react, m)?)?;
+    Ok(())
+}
+
 // I bet there is a way to make this automatically apply??
 //fn to_pyerr(e: anyhow::Error) -> PyErr {
     //pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
@@ -712,7 +730,7 @@ async fn on_message_for_python(
     let wroom = WrappedRoom { room: room.clone() };
     let py_events: Result<Vec<AnyEventPy>, anyhow::Error> = Python::with_gil(|py| {
         let pih = py_input_handler(py)?;
-        let result = pih.borrow(py).parse(wroom, &ev.event_id(), content)?;
+        let result = pih.borrow(py).parse(wroom, ev.event_id(), content)?;
         if result.is_none(py) {
             // Matched nothing or threw an exception?
             return Ok(vec!());
@@ -1082,11 +1100,11 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
 
     Python::with_gil(|py| -> PyResult<()> {
         let core_module = PyModule::new_bound(py, "trinity")?;
-        input::trinity(py, &core_module)?;
+        crate::trinity(py, &core_module)?;
         py.import_bound("sys")?.getattr("modules")?.set_item("trinity", core_module)?;
         let module = py.import_bound("plugins")?;
 
-        let pih = Py::new(py, InputHandler::new())?;
+        let pih = Py::new(py, InputHandler::new("mrgiggles"))?;
         py.import_bound("sys")?.setattr("app", pih)?;
 
         module.call_method0(intern!(py, "init"))?;

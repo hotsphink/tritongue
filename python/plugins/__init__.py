@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -39,7 +40,29 @@ class MatchGroup(int):
     pass
 
 
+# Command decorator
+def command(name=None, private=False, direct=False, defaults={}, pattern='[x&&y]'):
+    def decorator(func):
+        func._command_info = {
+            'cmd_name': name,
+            'pattern': pattern,
+            'defaults': defaults,
+            'private': private,
+            'direct': direct,
+            'command': func
+        }
+        return func
+    return decorator
+
 class Plugin(object):
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if not hasattr(cls, '_command_registry'):
+            cls._command_registry = {}
+        for name, attr in cls.__dict__.items():
+            if info := getattr(attr, '_command_info', None):
+                cls._command_registry[info['cmd_name']] = info
+
     def __init__(self, proto, plugin_name):
         self.proto = proto
         self.userInfo = proto.userInfo
@@ -48,20 +71,24 @@ class Plugin(object):
         self.name = plugin_name
         #self.registerHandlers()
         #self.registerEventHandlers()
-        self.registerCommands()
+        self.registered = set()
+        try:
+            self.registerDecoratedCommands()
+            self.registerCommands()
+            self.registerHandlersByMethodName()
+        except Exception as e:
+            import traceback
+            print(*traceback.format_exception(e))
+            raise
 
     def registerCommands(self):
-        for spec in self.COMMANDS:
+        for spec in getattr(self, 'COMMANDS', []):
             for pat, _private in [("command_{cmd}", False),
                                   ("private_command_{cmd}", True)]:
                 name = pat.format(cmd=spec['command'])
                 if func := getattr(self, name):
-                    async def wrapped_func(room, event_id, caps, func=func):
-                        #print(f"called wrapped_func(self={self}, room={room}, caps={list(caps)}), func={func}")
-                        result = await func(room, event_id, caps)
-                        await self.proto.process_message(room, result)
-
-                    trinity.register_input_handler(spec['pattern'], wrapped_func, spec.get('defaults'))
+                    self.proto.registerCommand(spec['command'], spec['pattern'], func, spec.get('defaults'))
+                    self.registered.add(spec['command'])
                     break
 
 
@@ -75,10 +102,27 @@ class Plugin(object):
             parts = method.split("command_", 1)
             if len(parts) == 2:
                 maybeprivate, name = parts
-                if maybeprivate == '':
-                    target.registerCommand(name, getattr(self, method), authRequired=False)
-                elif maybeprivate == 'private_':
-                    target.registerCommand(name, getattr(self, method), authRequired=True)
+                if name in self.registered:
+                    continue
+                private = maybeprivate == 'private_'
+                target.registerCommand(name, '[a&&b]', getattr(self, method), {}, authRequired=private)
+
+    def registerDecoratedCommands(self, target=None):
+        #print(f"Decorated commands: {self._command_registry}")
+        target = target or self.proto
+        for command in getattr(self, '_command_registry', {}).values():
+            target.registerCommand(
+                command['cmd_name'],
+                command['pattern'],
+                command['command'].__get__(self, self.__class__),
+                command['defaults'],
+                authRequired=command['private'],
+                directRequired=command['direct']
+            )
+            # FIXME: ...I think this registry is for avoiding command_foo when foo already exists. But here it'll
+            # be @command('foo', ...) def my_foo(...):, which means it ought to be skipping 'my_foo' in case it's called
+            # def command_blerp(...).
+            self.registered.add(command['cmd_name'])
 
     def registerEventHandlers(self, target=None):
         target = target or self.proto
@@ -284,7 +328,10 @@ class Bot(object):
     delay_re = re.compile(r'\<\.\.\.(?:([\d\.]+)\s?sec\.\.\.)?\>')
 
     def __init__(self):
-        self.config = {'plugins': {'knowledge': { 'class': 'KnowledgePlugin'}}}
+        self.config = {'plugins': {
+            'knowledge': { 'class': 'KnowledgePlugin'},
+            'pun': { 'class': 'PunPlugin' }
+        }}
         self.plugins = {}
         self.userInfo = {}
         for name, info in self.config.get('plugins', {}).items():
@@ -295,8 +342,17 @@ class Bot(object):
             print(f'{info["class"]}(self, "{name}")')
             self.plugins[name] = eval(f'{info["class"]}(self, "{name}")')
 
-    def registerCommand(self, name, callback, authRequired=False):
-        print(f"ignoring registerCommand({name}, auth={authRequired})")
+    def registerCommand(self, name, pattern, callback, defaults={}, authRequired=False, directRequired=False):
+        print(f"registerCommand({name}, auth={authRequired}, direct={directRequired})")
+
+        async def wrapped_func(room, event_id, caps, func=callback):
+            print(f"called wrapped_func(self={self}, room={room}, caps={list(caps)}), func={func}")
+            response = func(room, event_id, caps)
+            if inspect.isawaitable(response):
+                response = await response
+            await self.process_message(room, response)
+
+        trinity.register_input_handler(name, pattern, wrapped_func, defaults, directRequired)
 
     def registerPoller(self, interval, func, handle_err):
         print(f"ignoring registerPoller({interval}, {func},)")
