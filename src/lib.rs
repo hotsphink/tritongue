@@ -48,14 +48,14 @@ use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "wasm")]
 mod wasm_imports {
-    pub use wasm::{GuestState, Module, WasmModules};
-    pub use matrix_sdk::{
+    pub(crate) use crate::wasm::{GuestState, Module, WasmModules};
+    pub(crate) use matrix_sdk::{
         event_handler::Ctx,
         ruma::RoomId,
     };
-    use notify::{RecursiveMode, Watcher};
-    use room_resolver::RoomResolver;
-    use tokio::sync::Mutex;
+    pub(crate) use notify::{RecursiveMode, Watcher};
+    pub(crate) use crate::room_resolver::RoomResolver;
+    pub(crate) use tokio::sync::Mutex;
 }
 
 #[cfg(feature = "wasm")]
@@ -177,7 +177,7 @@ struct AuthInfo<'a> {
 pub(crate) type ShareableDatabase = Arc<redb::Database>;
 
 #[cfg(feature = "wasm")]
-#[pyclass]
+//#[pyclass]
 struct AppCtx {
     modules: WasmModules,
     modules_paths: Vec<PathBuf>,

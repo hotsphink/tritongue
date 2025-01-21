@@ -12,7 +12,7 @@ name = "tritongue"
 path = "src/bin/main.rs"
 
 [features]
-default = ["python"]
+default = ["python", "wasm"]
 wasm = ["dep:wasmtime"]
 python = ["dep:pyo3", "dep:pyo3-ffi", "dep:pyo3-asyncio-0-21"]
 
