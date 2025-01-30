@@ -2,7 +2,7 @@
   <h1><code>tritongue</code></h1>
 
   <p>
-    <strong>Matrix bots in Rust and WebAssembly</strong>
+    <strong>Matrix bots in Rust / WebAssembly / Python</strong>
   </p>
 
   <p>
