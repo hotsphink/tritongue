@@ -1147,15 +1147,17 @@ pub async fn run(config: BotConfig) -> anyhow::Result<()> {
     client.add_event_handler(on_stripped_state_member);
     client.add_event_handler(on_verification_request);
 
-    tokio::select! {
-        _ = handle_signals() => {
-            println!("Signal received");
-            // Exit :)
-        }
+    loop {
+        tokio::select! {
+            _ = handle_signals() => {
+                println!("Signal received");
+                break
+                // Exit :)
+            }
 
-        Err(err) = client.sync(sync_settings) => {
-            println!("Error caught");
-            bail!(err);
+            Err(err) = client.sync(sync_settings.clone()) => {
+                println!("Error caught: {}", err);
+            }
         }
     }
 
